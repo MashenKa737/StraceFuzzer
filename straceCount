@@ -3,7 +3,7 @@
 selfName=$0
 tempFileName="./.tempStraceFile"
 
-if [ -z "$1" ];  
+if [ -z "$1" ]
 then
 	echo -e " Wrong number of argument\n"\
 		"Please, choose a command to analyze\n"\
@@ -11,15 +11,17 @@ then
 	exit -1
 fi
 
-StraceArguments=$*
-strace -c -o $tempFileName $StraceArguments 
+StraceArguments=( $* )
 
-IFS=$'\n'
-arr=( $(cat $tempFileName) )
+# It is often useful to interrupt process from keyboard
+# We should contunue execution of script after strace returns
+trap "echo 'Termination of strace via Ctrl-C or SIGINT'" SIGINT
+IFS=$'\n' arr=( `strace -c ${StraceArguments[@]} 2>&1` )
+trap -- SIGINT
+
 elemNum=${#arr[@]}
 
 for (( inc = 2; inc < elemNum - 2; inc++))
 do
 	echo "${arr[inc]}" | awk '{printf "%-20s %-10s\n", $NF, $4;}' 
 done
-rm $tempFileName
