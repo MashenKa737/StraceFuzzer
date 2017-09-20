@@ -1,7 +1,6 @@
 #!/bin/bash
 
 selfName=$0
-tempFileName="./.tempStraceFile"
 
 if [ -z "$1" ]
 then
@@ -13,15 +12,23 @@ fi
 
 StraceArguments=( $* )
 
+# Extra file descriptor is used to redirect standard output.
+# If standart output of traced process will be in 'arr' variable,
+# it can overflow it. Moreover, standard output is useless for strace summary.
+exec 3>&1
+
 # It is often useful to interrupt process from keyboard
 # We should contunue execution of script after strace returns
 trap "echo 'Termination of strace via Ctrl-C or SIGINT'" SIGINT
-IFS=$'\n' arr=( `strace -c ${StraceArguments[@]} 2>&1` )
+
+IFS=$'\n' arr=( `{ strace -c ${StraceArguments[@]} 1>&3; } 2>&1` )
+
 trap -- SIGINT
+exec 3>&-
 
 elemNum=${#arr[@]}
 
-for (( inc = 2; inc < elemNum - 2; inc++))
+for (( inc = 0; inc < elemNum; inc++))
 do
-	echo "${arr[inc]}" | awk '{printf "%-20s %-10s\n", $NF, $4;}' 
+	echo "${arr[inc]}" | awk '{printf "%-20s %-10s\n", $NF, $4;}' 1>&2 
 done
