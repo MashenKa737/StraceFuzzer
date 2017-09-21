@@ -1,10 +1,10 @@
 BEGIN {
 	flagWasStart = 0
-	separatingRegex = "^[\ \t\-]*[\-]+[\ \t\-]*$"
-	C_identifierRegex = "^[_a-zA-Z][_a-zA-Z0-9]*$"
-	numbersRegex = "^[0-9]+$"
-	percentRegex = "^(100\.00)|([0-9]{1,2}\.[0-9]{2})$"
-	secondsRegex = "^[0-9]+\.[0-9]{6}$"
+	separatingRegex = "^(-+[[:blank:]]+){5}-+[[:blank:]]*$"
+	C_identifierRegex = "^[_a-zA-Z]\\w*$"
+	numbersRegex = "^[[:digit:]]+$"
+	percentRegex = "^(100\\.00)|([[:digit:]]{1,2}\\.[[:digit:]]{2})$"
+	secondsRegex = "^[[:digit:]]+\\.[[:digit:]]{6}$"
 	true = 1
 	false = 0
 }
@@ -15,7 +15,7 @@ BEGIN {
 		next
 	} else if (flagWasStart == 1 && $0 ~ separatingRegex) {
 		flagWasStart = 0
-	} else if (flagWasStart == 1 && testCorrectStraceOutput()) {
+	} else if (flagWasStart == 1 && testCorrectStraceOutput() == $true) {
 		printf "%-20s %-10s\n", $NF, $4
 	} else {
 		print "awk: Wrong strace output format. Be careful if output of traced process "\

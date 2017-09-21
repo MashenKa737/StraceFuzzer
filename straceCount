@@ -2,6 +2,31 @@
 
 selfName=$0
 processStraceOutputScriptPath="./.processStraceOutput.awk"
+textParcingProgram="gawk"
+
+readonly failure=0
+readonly success=1
+
+function testCommandInstalled {
+	if [ $# -ne 1 ]; then
+		return $failure
+	fi
+	local paths
+	IFS=$':' paths=( $PATH )
+	for path in ${paths[@]}
+	do
+		if [ -f "$path/$1" ]; then
+			return $success
+		fi
+	done
+	return $failure
+}
+
+testCommandInstalled $textParcingProgram
+if [ `echo $?` -ne $success ]; then
+	echo "straceCount: gawk is used for parcing strace output. Please, install gawk."
+	exit -1
+fi
 
 if [ -z "$1" ]
 then
@@ -20,7 +45,7 @@ exec 3>&1
 
 # It is often useful to interrupt process from keyboard
 # We should contunue execution of script after strace returns
-trap "echo 'Termination of strace via Ctrl-C or SIGINT'" SIGINT
+trap "echo 'straceCount: termination of strace via Ctrl-C or SIGINT'" SIGINT
 
 IFS=$'\n' arr=( `{ strace -c ${StraceArguments[@]} 1>&3; } 2>&1` )
 
@@ -28,5 +53,4 @@ trap -- SIGINT
 exec 3>&-
 
 elemNum=${#arr[@]}
-
-printf "%s\n" "${arr[@]}" | awk -f$processStraceOutputScriptPath 1>&2
+printf "%s\n" "${arr[@]}" | gawk -f$processStraceOutputScriptPath 1>&2
