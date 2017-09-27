@@ -1,6 +1,5 @@
 import sys
 import os
-import multiprocessing
 import signal
 import time
 import itertools
@@ -31,20 +30,49 @@ class InjectionGenerator:
         return "fault=open:error=ENOENT:when=4"
 
 
+class AbstractPipeProcess:
+    def __init__(self):
+        self.pid = None
+        self._exitcode = None
+        (self._r, self._w) = None, None
+
+    def start(self):
+        raise NotImplementedError
+
+    def terminate(self):
+        raise NotImplementedError
+
+    def exitcode(self):
+        self._update_exitcode()
+        return self._exitcode
+
+    def _update_exitcode(self):
+        if self._exitcode is not None:
+            return
+
+        (pid, status) = os.waitpid(self.pid, os.WNOHANG)
+        if pid == 0:
+            return
+
+        if os.WIFSIGNALED(status):
+            self._exitcode = - os.WTERMSIG(status)
+        elif os.WIFEXITED(status):
+            self._exitcode = os.WEXITSTATUS(status)
+
+
 # the bicycle for subprocess.Popen
-class TracerProcess:
+class TracerProcess(AbstractPipeProcess):
     def __init__(self, pid, fault):
+        AbstractPipeProcess.__init__(self)
         self._tracee_pid = pid
         self._fault = fault
-        self._exitcode = None
-        self.pid = None
-        (self._r, self._w) = None, None
         self.err = None
 
         # TODO temporary hardcode
         self.args = "/home/ilya/strace/bin/strace", "-p",\
                     str(self._tracee_pid), "-e", self._fault
 
+    # override
     def start(self):
         (self._r, self._w) = os.pipe2(os.O_NONBLOCK)
         self.pid = os.fork()
@@ -76,29 +104,13 @@ class TracerProcess:
 
         return lines
 
+    # override
     def terminate(self):
         if self.exitcode() is None:
             os.kill(self.pid, signal.SIGTERM)
             self.err.close()
             self.err = None
             self._update_exitcode()
-
-    def exitcode(self):
-        self._update_exitcode()
-        return self._exitcode
-
-    def _update_exitcode(self):
-        if self._exitcode is not None:
-            return
-
-        (pid, status) = os.waitpid(self.pid, os.WNOHANG)
-        if pid == 0:
-            return
-
-        if os.WIFSIGNALED(status):
-            self._exitcode = - os.WTERMSIG(status)
-        elif os.WIFEXITED(status):
-            self._exitcode = os.WEXITSTATUS(status)
 
     def _execute_tracer(self):
         os.close(self._r)
@@ -113,15 +125,14 @@ class TracerProcess:
             exit(1)
 
 
-class TraceeProcess:
+class TraceeProcess(AbstractPipeProcess):
     def __init__(self, target, args):
+        AbstractPipeProcess.__init__(self)
         self.target = "/home/ilya/StraceFuzzer/test/test1"
         self.args = "/home/ilya/StraceFuzzer/test/test1"
-        (self._r, self._w) = None, None
-        self.pid = None
         self.write = None
-        self._exitcode = None
 
+    # override
     def start(self):
         (self._r, self._w) = os.pipe2(0)
         self.pid = os.fork()
@@ -152,23 +163,7 @@ class TraceeProcess:
         self.write.close()
         self.write = None
 
-    def exitcode(self):
-        self._update_exitcode()
-        return self._exitcode
-
-    def _update_exitcode(self):
-        if self._exitcode is not None:
-            return
-
-        (pid, status) = os.waitpid(self.pid, os.WNOHANG)
-        if pid == 0:
-            return
-
-        if os.WIFSIGNALED(status):
-            self._exitcode = - os.WTERMSIG(status)
-        elif os.WIFEXITED(status):
-            self._exitcode = os.WEXITSTATUS(status)
-
+    # override
     def terminate(self):
         if self.exitcode() is None:
             os.kill(self.pid, signal.SIGTERM)
