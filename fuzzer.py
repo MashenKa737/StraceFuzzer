@@ -13,6 +13,7 @@ class ArgvHandler:
             self.target = None
         else:
             self.target = sys.argv[1]
+            self.args_target = []
 
     def target(self):
         return self.target
@@ -35,7 +36,7 @@ class TracerProcess:
     def __init__(self, pid, fault):
         self._tracee_pid = pid
         self._fault = fault
-        self.exitcode = None
+        self._exitcode = None
         self.pid = None
         (self._r, self._w) = None, None
         self.err = None
@@ -51,6 +52,7 @@ class TracerProcess:
             self._execute_tracer()
 
         os.close(self._w)
+        os.set_inheritable(self._r, False)
         self.err = os.fdopen(self._r, mode="rt")
 
     def readlines(self, timeout):
@@ -58,7 +60,10 @@ class TracerProcess:
         # current implementation uses busy loop
         # further development might abandon this solution
         # 'select' module will probably be used
-        if self.exitcode is not None:
+
+        # we are checking _exitcode, not exitcode() as there can be some useful
+        # information in pipe
+        if self._exitcode is not None:
             return []
 
         lines = []
@@ -66,34 +71,34 @@ class TracerProcess:
         while time.perf_counter() - clock < timeout:
             time.sleep(1)
             lines.extend(itertools.takewhile(lambda line: line != "", self.err.readlines()))
-            self._update_exitcode()
-            if self.exitcode is not None:
+            if self.exitcode() is not None:
                 break
 
         return lines
 
     def terminate(self):
-        self._update_exitcode()
-        if self.exitcode is None:
+        if self.exitcode() is None:
             os.kill(self.pid, signal.SIGTERM)
             self.err.close()
+            self.err = None
             self._update_exitcode()
 
+    def exitcode(self):
+        self._update_exitcode()
+        return self._exitcode
+
     def _update_exitcode(self):
-        if self.exitcode is not None:
+        if self._exitcode is not None:
             return
 
         (pid, status) = os.waitpid(self.pid, os.WNOHANG)
         if pid == 0:
             return
 
-        assert pid == self.pid,\
-            "pid returned by successful waitpid doesn't equal to child's pid"
-
         if os.WIFSIGNALED(status):
-            self.exitcode = - os.WTERMSIG(status)
+            self._exitcode = - os.WTERMSIG(status)
         elif os.WIFEXITED(status):
-            self.exitcode = os.WEXITSTATUS(status)
+            self._exitcode = os.WEXITSTATUS(status)
 
     def _execute_tracer(self):
         os.close(self._r)
@@ -108,16 +113,66 @@ class TracerProcess:
             exit(1)
 
 
-def execute_tracee(conn_start, target):
-    try:
-        msg = conn_start.recv()
-    except EOFError:  # parent process is killed
-        exit(1)
-    else:
-        if msg == "start":
-            os.execl("/home/ilya/StraceFuzzer/test/test1", "/home/ilya/StraceFuzzer/test/test1")
+class TraceeProcess:
+    def __init__(self, target, args):
+        self.target = "/home/ilya/StraceFuzzer/test/test1"
+        self.args = "/home/ilya/StraceFuzzer/test/test1"
+        (self._r, self._w) = None, None
+        self.pid = None
+        self.write = None
+        self._exitcode = None
 
-    exit(1)
+    def start(self):
+        (self._r, self._w) = os.pipe2(0)
+        self.pid = os.fork()
+        if self.pid == 0:
+            self._execute_tracee()
+
+        os.close(self._r)
+        os.set_inheritable(self._w, False)
+        self.write = os.fdopen(self._w, mode="wt")
+
+    def _execute_tracee(self):
+        os.close(self._w)
+        read_parent = os.fdopen(self._r, mode="rt")
+        try:
+            msg = read_parent.readline()
+            read_parent.close()
+            if msg == "start\n":
+                os.execl(self.target, self.args)
+
+        except OSError as exc:
+            # TODO think about how to tell parent that target cannot be processed
+            raise
+
+        exit(1)
+
+    def start_actual_tracee(self):
+        print("start", file=self.write)
+        self.write.close()
+        self.write = None
+
+    def exitcode(self):
+        self._update_exitcode()
+        return self._exitcode
+
+    def _update_exitcode(self):
+        if self._exitcode is not None:
+            return
+
+        (pid, status) = os.waitpid(self.pid, os.WNOHANG)
+        if pid == 0:
+            return
+
+        if os.WIFSIGNALED(status):
+            self._exitcode = - os.WTERMSIG(status)
+        elif os.WIFEXITED(status):
+            self._exitcode = os.WEXITSTATUS(status)
+
+    def terminate(self):
+        if self.exitcode() is None:
+            os.kill(self.pid, signal.SIGTERM)
+            self._update_exitcode()
 
 
 if __name__ == '__main__':
@@ -126,8 +181,7 @@ if __name__ == '__main__':
         exit(1)
 
     for fault in InjectionGenerator():
-        (r, w) = multiprocessing.Pipe(duplex=False)
-        tracee = multiprocessing.Process(target=execute_tracee, args=(r, argvHandler.target))
+        tracee = TraceeProcess(argvHandler.target, argvHandler.args_target)
         tracee.start()
 
         try:
@@ -151,24 +205,25 @@ if __name__ == '__main__':
         else:
             # TODO add more error handling
             print("fuzzer: some error occured:\ntracee exitcode: {}\ntracer exitcode: {}"
-                  .format(tracee.exitcode, tracer.exitcode, file=sys.stderr))
+                  .format(tracee.exitcode(), tracer.exitcode(), file=sys.stderr))
 
             tracer.terminate()
             tracee.terminate()
             exit(1)
 
         try:
-            w.send("start")
+            tracee.start_actual_tracee()
         except BrokenPipeError:
             print("fuzzer: tracee was externally terminated: exitcode {}".
-                  format(tracee.exitcode), file=sys.stderr)
+                  format(tracee.exitcode()), file=sys.stderr)
+            exit(1)
 
         # TODO the main branch of further development
         strace_stderr = tracer.readlines(timeout=1)
         for line in strace_stderr:
             print(line, file=sys.stderr, end='')
 
-        if tracee.exitcode == - signal.SIGSEGV:
+        if tracee.exitcode() == - signal.SIGSEGV:
             print("Yahoooo!")
             exit(0)
 
