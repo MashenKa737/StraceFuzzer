@@ -59,6 +59,10 @@ class AbstractPipeProcess:
         elif os.WIFEXITED(status):
             self._exitcode = os.WEXITSTATUS(status)
 
+    @staticmethod
+    def _say_parent_was_killed():
+        print("fuzzer: main program was terminated", file=sys.stderr)
+
 
 # the bicycle for subprocess.Popen
 class TracerProcess(AbstractPipeProcess):
@@ -115,51 +119,91 @@ class TracerProcess(AbstractPipeProcess):
     def _execute_tracer(self):
         os.close(self._r)
         try:
+            # TODO find out whether it is necessary to close self._w
             os.dup2(self._w, sys.stderr.fileno())
 
             # TODO temporary hardcode
             os.execvp("/home/ilya/strace/bin/strace", self.args)
         except OSError as exc:
             # It will be send through pipe, if dup2 call was successful
-            print("fuzzer: cannot run strace: {}".format(exc.strerror), file=sys.stderr)
+            try:
+                print("fuzzer: cannot run strace: {}".format(exc.strerror), file=sys.stderr)
+            except BrokenPipeError:
+                AbstractPipeProcess._say_parent_was_killed()
             exit(1)
 
 
 class TraceeProcess(AbstractPipeProcess):
     def __init__(self, target, args):
         AbstractPipeProcess.__init__(self)
+        del (self._w, self._r)
+        (self._rstart, self._wstart) = None, None
+        (self._rwait, self._wwait) = None, None
         self.target = "/home/ilya/StraceFuzzer/test/test1"
         self.args = "/home/ilya/StraceFuzzer/test/test1"
         self.write = None
+        self.read = None
 
     # override
     def start(self):
-        (self._r, self._w) = os.pipe2(0)
+        (self._rstart, self._wstart) = os.pipe2(os.O_CLOEXEC)
+        (self._rwait, self._wwait) = os.pipe2(os.O_CLOEXEC)
         self.pid = os.fork()
         if self.pid == 0:
             self._execute_tracee()
 
-        os.close(self._r)
-        os.set_inheritable(self._w, False)
-        self.write = os.fdopen(self._w, mode="wt")
+        os.close(self._wwait)
+        os.close(self._rstart)
+        os.set_inheritable(self._rwait, False)
+        os.set_inheritable(self._wstart, False)
+        self.write = os.fdopen(self._wstart, mode="wb", buffering=0)
+        self.read = os.fdopen(self._rwait, mode="rb", buffering=0)
 
     def _execute_tracee(self):
-        os.close(self._w)
-        read_parent = os.fdopen(self._r, mode="rt")
+        os.close(self._rwait)
+        os.close(self._wstart)
+        parent_write = os.fdopen(self._wwait, mode="wb", buffering=0)
+        parent_read = os.fdopen(self._rstart, mode="rb", buffering=0)
         try:
-            msg = read_parent.readline()
-            read_parent.close()
-            if msg == "start\n":
+            parent_write.write(b'wait')
+            msg = parent_read.read(len(b'start'))
+            parent_read.close()
+            if msg == b'start':
                 os.execl(self.target, self.args)
 
+        except BrokenPipeError:
+            parent_read.close()
+            AbstractPipeProcess._say_parent_was_killed()
         except OSError as exc:
-            # TODO think about how to tell parent that target cannot be processed
-            raise
+            try:
+                parent_write.write(b'fuzzer: cannot run tracee: ' + exc.strerror.encode())
+            except BrokenPipeError:
+                AbstractPipeProcess._say_parent_was_killed()
 
+        parent_write.close()
         exit(1)
 
-    def start_actual_tracee(self):
-        print("start", file=self.write)
+    def wait_for_started(self):
+        # It cannot be blocked in any way and might execute relatively quickly
+        msg = self.read.read(len(b'wait'))
+        os.set_blocking(self.read.fileno(), False)
+        if msg == b'wait':
+            return True
+        else:
+            self.read.close()
+            self.read = None
+            return False
+
+    # TODO this function can be useful for determination of whether tracee cannot be executed
+    # returns b'' if tracee successfully calls os.exec
+    # otherwise returns None or error message depending on the data available
+    def execution_error(self):
+        assert not os.get_blocking(self.read.fileno()), "Blocking read is prohibited"
+        msg = self.read.read(1024)
+        return msg
+
+    def start_actual_tracee(self):  # throws BrokenPipeError
+        self.write.write(b'start')
         self.write.close()
         self.write = None
 
@@ -178,6 +222,11 @@ if __name__ == '__main__':
     for fault in InjectionGenerator():
         tracee = TraceeProcess(argvHandler.target, argvHandler.args_target)
         tracee.start()
+        success = tracee.wait_for_started()
+        if success == False:
+            print("fuzzer: tracee was externally terminated: exitcode {}".
+                  format(tracee.exitcode()), file=sys.stderr)
+            exit(1)
 
         try:
             tracer = TracerProcess(pid=tracee.pid, fault=fault)
