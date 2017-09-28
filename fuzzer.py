@@ -3,6 +3,7 @@ import os
 import signal
 import time
 import itertools
+import select
 
 
 # TODO add processing arguments
@@ -66,6 +67,8 @@ class AbstractPipeProcess:
 
 # the bicycle for subprocess.Popen
 class TracerProcess(AbstractPipeProcess):
+    _TIMEOUT_SELECT = 0.1
+
     def __init__(self, pid, fault):
         AbstractPipeProcess.__init__(self)
         self._tracee_pid = pid
@@ -79,33 +82,41 @@ class TracerProcess(AbstractPipeProcess):
     # call it only once
     # override
     def start(self):
-        # TODO make output riderection blocking, use select to read strace stderr
-        (self._r, self._w) = os.pipe2(os.O_NONBLOCK)
+        # Blocking mode of pipe is used in tracer process in order to guarantee
+        # that there is no data loss of strace output, though it may be slower
+        # non-blocking mode of pipe is used in parent process
+        # for convenient usage of self.err.readlines().
+        # Otherwise, we will have to use only low-level os.read
+        (self._r, self._w) = os.pipe2(0)
         self.pid = os.fork()
         if self.pid == 0:
             self._execute_tracer()
 
         os.close(self._w)
+        os.set_blocking(self._r, False)
         os.set_inheritable(self._r, False)
         self.err = os.fdopen(self._r, mode="rt")
 
     def readlines(self, timeout):
-        # TODO
-        # current implementation uses busy loop
-        # further development might abandon this solution
-        # 'select' module will probably be used
-
-        # we are checking _exitcode, not exitcode() as there can be some useful
-        # information in pipe
-        if self._exitcode is not None:
-            return []
-
         lines = []
         clock = time.perf_counter()
-        while time.perf_counter() - clock < timeout:
-            time.sleep(1)
-            lines.extend(itertools.takewhile(lambda line: line != "", self.err.readlines()))
+        while True:
+            timeout_left = timeout - (time.perf_counter() - clock)
+            if timeout_left <= 0:
+                break
+
+            select_timeout = TracerProcess._TIMEOUT_SELECT \
+                if timeout_left > TracerProcess._TIMEOUT_SELECT \
+                else timeout_left
+
+            (readable, _, _) = select.select([self.err], [], [], select_timeout)
+            if len(readable) == 0:
+                break
+            lines.extend(itertools.takewhile(lambda line: line != "", readable[0].readlines()))
             if self.exitcode() is not None:
+                (readable, _, _) = select.select([self.err], [], [], 0)
+                if len(readable) != 0:
+                    lines.extend(itertools.takewhile(lambda line: line != "", readable[0].readlines()))
                 break
 
         return lines
@@ -175,7 +186,7 @@ class TraceeProcess(AbstractPipeProcess):
             AbstractPipeProcess._say_parent_was_killed()
         except OSError as exc:
             try:
-                os.write(self._wwait, exc.errno.to_bytes(sys.getsizeof(msg), byteorder=sys.byteorder))
+                os.write(self._wwait, exc.errno.to_bytes(sys.getsizeof(exc.errno), byteorder=sys.byteorder))
             except BrokenPipeError:
                 AbstractPipeProcess._say_parent_was_killed()
 
@@ -246,7 +257,7 @@ if __name__ == '__main__':
 
         tracer = TracerProcess(pid=tracee.pid, fault=fault)
         tracer.start()
-        strace_stderr = tracer.readlines(timeout=1)
+        strace_stderr = tracer.readlines(timeout=0.5)
 
         if len(strace_stderr) == 1 and strace_stderr[0].startswith("fuzzer: cannot run strace:"):
             print(strace_stderr[0], file=sys.stderr, end='')
@@ -276,6 +287,7 @@ if __name__ == '__main__':
         for line in strace_stderr:
             print(line, file=sys.stderr, end='')
 
+        time.sleep(1)
         if tracee.exitcode() == - signal.SIGSEGV:
             print("Yahoooo!")
             exit(0)
