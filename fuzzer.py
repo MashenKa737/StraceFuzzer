@@ -121,8 +121,8 @@ class TracerProcess(AbstractPipeProcess):
     def _execute_tracer(self):
         os.close(self._r)
         try:
-            # TODO find out whether it is necessary to close self._w
             os.dup2(self._w, sys.stderr.fileno())
+            os.close(self._w)
 
             # TODO temporary hardcode
             os.execvp("/home/ilya/strace/bin/strace", self.args)
@@ -214,9 +214,14 @@ class TraceeProcess(AbstractPipeProcess):
         return msg
 
     # call it only once
-    def start_actual_tracee(self):  # throws BrokenPipeError
-        os.write(self._wstart, b'start')
+    def start_actual_tracee(self):
+        success = True
+        try:
+            os.write(self._wstart, b'start')
+        except BrokenPipeError:
+            success = False
         os.close(self._wstart)
+        return success
 
     # override
     def terminate(self):
@@ -239,14 +244,8 @@ if __name__ == '__main__':
                   format(tracee.exitcode()), file=sys.stderr)
             exit(1)
 
-        try:
-            tracer = TracerProcess(pid=tracee.pid, fault=fault)
-            tracer.start()
-
-        except OSError as exc:
-            print("fuzzer: cannot run strace: {}".format(exc.strerror))
-            exit(1)
-
+        tracer = TracerProcess(pid=tracee.pid, fault=fault)
+        tracer.start()
         strace_stderr = tracer.readlines(timeout=1)
 
         if len(strace_stderr) == 1 and strace_stderr[0].startswith("fuzzer: cannot run strace:"):
@@ -266,9 +265,8 @@ if __name__ == '__main__':
             tracee.terminate()
             exit(1)
 
-        try:
-            tracee.start_actual_tracee()
-        except BrokenPipeError:
+        success = tracee.start_actual_tracee()
+        if not success:
             print("fuzzer: tracee was externally terminated: exitcode {}".
                   format(tracee.exitcode()), file=sys.stderr)
             exit(1)
