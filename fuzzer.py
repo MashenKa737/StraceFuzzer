@@ -76,8 +76,10 @@ class TracerProcess(AbstractPipeProcess):
         self.args = "/home/ilya/strace/bin/strace", "-p",\
                     str(self._tracee_pid), "-e", self._fault
 
+    # call it only once
     # override
     def start(self):
+        # TODO make output riderection blocking, use select to read strace stderr
         (self._r, self._w) = os.pipe2(os.O_NONBLOCK)
         self.pid = os.fork()
         if self.pid == 0:
@@ -144,6 +146,7 @@ class TraceeProcess(AbstractPipeProcess):
         self.write = None
         self.read = None
 
+    # call it only once
     # override
     def start(self):
         (self._rstart, self._wstart) = os.pipe2(os.O_CLOEXEC)
@@ -156,56 +159,64 @@ class TraceeProcess(AbstractPipeProcess):
         os.close(self._rstart)
         os.set_inheritable(self._rwait, False)
         os.set_inheritable(self._wstart, False)
-        self.write = os.fdopen(self._wstart, mode="wb", buffering=0)
-        self.read = os.fdopen(self._rwait, mode="rb", buffering=0)
 
     def _execute_tracee(self):
         os.close(self._rwait)
         os.close(self._wstart)
-        parent_write = os.fdopen(self._wwait, mode="wb", buffering=0)
-        parent_read = os.fdopen(self._rstart, mode="rb", buffering=0)
         try:
-            parent_write.write(b'wait')
-            msg = parent_read.read(len(b'start'))
-            parent_read.close()
+            os.write(self._wwait, b'wait')
+            msg = os.read(self._rstart, len(b'start'))
+            os.close(self._rstart)
             if msg == b'start':
                 os.execl(self.target, self.args)
 
         except BrokenPipeError:
-            parent_read.close()
+            os.close(self._rstart)
             AbstractPipeProcess._say_parent_was_killed()
         except OSError as exc:
             try:
-                parent_write.write(b'fuzzer: cannot run tracee: ' + exc.strerror.encode())
+                os.write(self._wwait, exc.errno.to_bytes(sys.getsizeof(msg), byteorder=sys.byteorder))
             except BrokenPipeError:
                 AbstractPipeProcess._say_parent_was_killed()
 
-        parent_write.close()
+        os.close(self._wwait)
         exit(1)
 
+    # call it only after start method and only once
+    # if returns false, calling any method using pipe (e. g. execution_error_msg) is prohibited
     def wait_for_started(self):
         # It cannot be blocked in any way and might execute relatively quickly
-        msg = self.read.read(len(b'wait'))
-        os.set_blocking(self.read.fileno(), False)
+        msg = os.read(self._rwait, len(b'wait'))
         if msg == b'wait':
             return True
         else:
-            self.read.close()
-            self.read = None
+            os.close(self._rwait)
+            os.close(self._wstart)
             return False
 
     # TODO this function can be useful for determination of whether tracee cannot be executed
-    # returns b'' if tracee successfully calls os.exec
-    # otherwise returns None or error message depending on the data available
-    def execution_error(self):
-        assert not os.get_blocking(self.read.fileno()), "Blocking read is prohibited"
-        msg = self.read.read(1024)
+    # returns error message, if calling os.exec by tracee was unsuccessful
+    # returns None, if os.exec was not called yet
+    # return "", if os.exec was called successfully
+    # if returns not None, calling once again is prohibited
+    def execution_error_msg(self):
+        msg = ""
+        if os.get_blocking(self._rwait):
+            os.set_blocking(self._rwait, False)
+        try:
+            errno_bytes = os.read(self._rwait, sys.getsizeof(int()))
+        except BlockingIOError:
+            return None
+        if len(errno_bytes) != 0:
+            errno = int.from_bytes(errno_bytes, byteorder=sys.byteorder)
+            msg = "fuzzer: cannot run tracee: {}".format(os.strerror(errno))
+        os.close(self._rwait)
         return msg
 
+    # call it only once
     def start_actual_tracee(self):  # throws BrokenPipeError
-        self.write.write(b'start')
-        self.write.close()
-        self.write = None
+        os.write(self._wstart, b'start')
+        os.close(self._wstart)
 
     # override
     def terminate(self):
@@ -223,7 +234,7 @@ if __name__ == '__main__':
         tracee = TraceeProcess(argvHandler.target, argvHandler.args_target)
         tracee.start()
         success = tracee.wait_for_started()
-        if success == False:
+        if not success:
             print("fuzzer: tracee was externally terminated: exitcode {}".
                   format(tracee.exitcode()), file=sys.stderr)
             exit(1)
