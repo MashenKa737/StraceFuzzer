@@ -4,19 +4,30 @@ import signal
 import time
 import itertools
 import select
+import argparse
 
 
-# TODO add processing arguments
 class ArgvHandler:
     def __init__(self):
-        if len(sys.argv) != 2:
-            self.target = None
-        else:
-            self.target = sys.argv[1]
-            self.args_target = []
+        parser = argparse.ArgumentParser(description="injects errors into syscalls of targeted executable",
+                                         allow_abbrev=False)
+        parser.add_argument('-s', '--strace', action='store', default='strace',
+                            help='path to strace executable', dest='strace_executable')
+        parser.add_argument('target', action='store', help='targeted executable')
+
+        parser.add_argument('args', action='store', nargs=argparse.REMAINDER,
+                            help='arguments of targeted executable')
+
+        self._args = parser.parse_args()
 
     def target(self):
-        return self.target
+        return self._args.target
+
+    def strace_executable(self):
+        return self._args.strace_executable
+
+    def target_args(self):
+        return self._args.args
 
 
 # should be linked with other part of project in any way
@@ -74,10 +85,8 @@ class TracerProcess(AbstractPipeProcess):
         self._tracee_pid = pid
         self._fault = fault
         self.err = None
-
-        # TODO temporary hardcode
-        self.args = "/home/ilya/strace/bin/strace", "-p",\
-                    str(self._tracee_pid), "-e", self._fault
+        self.executable = 'strace'
+        self.args = "-p", str(self._tracee_pid), "-e", self._fault
 
     # call it only once
     # override
@@ -96,6 +105,9 @@ class TracerProcess(AbstractPipeProcess):
         os.set_blocking(self._r, False)
         os.set_inheritable(self._r, False)
         self.err = os.fdopen(self._r, mode="rt")
+
+    def set_executable(self, executable):
+        self.executable = executable
 
     def readlines(self, timeout):
         lines = []
@@ -134,9 +146,7 @@ class TracerProcess(AbstractPipeProcess):
         try:
             os.dup2(self._w, sys.stderr.fileno())
             os.close(self._w)
-
-            # TODO temporary hardcode
-            os.execvp("/home/ilya/strace/bin/strace", self.args)
+            os.execlp(self.executable, self.executable, *self.args)
         except OSError as exc:
             # It will be send through pipe, if dup2 call was successful
             try:
@@ -152,8 +162,8 @@ class TraceeProcess(AbstractPipeProcess):
         del (self._w, self._r)
         (self._rstart, self._wstart) = None, None
         (self._rwait, self._wwait) = None, None
-        self.target = "/home/ilya/StraceFuzzer/test/test1"
-        self.args = "/home/ilya/StraceFuzzer/test/test1"
+        self.target = target
+        self.args = args
         self.write = None
         self.read = None
 
@@ -179,7 +189,7 @@ class TraceeProcess(AbstractPipeProcess):
             msg = os.read(self._rstart, len(b'start'))
             os.close(self._rstart)
             if msg == b'start':
-                os.execl(self.target, self.args)
+                os.execlp(self.target, self.target, *self.args)
 
         except BrokenPipeError:
             os.close(self._rstart)
@@ -243,11 +253,9 @@ class TraceeProcess(AbstractPipeProcess):
 
 if __name__ == '__main__':
     argvHandler = ArgvHandler()
-    if argvHandler.target is None:
-        exit(1)
 
     for fault in InjectionGenerator():
-        tracee = TraceeProcess(argvHandler.target, argvHandler.args_target)
+        tracee = TraceeProcess(argvHandler.target(), argvHandler.target_args())
         tracee.start()
         success = tracee.wait_for_started()
         if not success:
@@ -256,15 +264,17 @@ if __name__ == '__main__':
             exit(1)
 
         tracer = TracerProcess(pid=tracee.pid, fault=fault)
+        tracer.set_executable(argvHandler.strace_executable())
         tracer.start()
         strace_stderr = tracer.readlines(timeout=0.5)
+        for line in strace_stderr:
+            print(line, file=sys.stderr, end='')
 
         if len(strace_stderr) == 1 and strace_stderr[0].startswith("fuzzer: cannot run strace:"):
             print(strace_stderr[0], file=sys.stderr, end='')
             exit(1)
 
-        # TODO temporary hardcode
-        elif "/home/ilya/strace/bin/strace: Process {} attached\n".format(tracee.pid) in \
+        elif tracer.executable + ": Process {} attached\n".format(tracee.pid) in \
                 strace_stderr:
             pass
         else:
