@@ -2,10 +2,9 @@ import sys
 import os
 import signal
 import time
-import itertools
 import select
 import argparse
-
+import re
 
 
 class ArgvHandler:
@@ -87,8 +86,6 @@ class AbstractPipeProcess:
 
 # the bicycle for subprocess.Popen
 class TracerProcess(AbstractPipeProcess):
-    _TIMEOUT_SELECT = 0.1
-
     def __init__(self, pid, fault):
         AbstractPipeProcess.__init__(self)
         self._tracee_pid = pid
@@ -118,29 +115,26 @@ class TracerProcess(AbstractPipeProcess):
     def set_executable(self, executable):
         self.executable = executable
 
-    def readlines(self, timeout):
-        lines = []
+    def readbuf(self, timeout):
+        buf = str()
         clock = time.perf_counter()
+        timeout_left = timeout
         while True:
+            (readable, _, _) = select.select([self.err], [], [], timeout_left)
+            if len(readable) == 0:
+                break
+            buf = buf + readable[0].read()
+            if self.exitcode() is not None:
+                (readable, _, _) = select.select([self.err], [], [], 0)
+                if len(readable) != 0:
+                    buf = buf + readable[0].read()
+                break
+
             timeout_left = timeout - (time.perf_counter() - clock)
             if timeout_left <= 0:
                 break
 
-            select_timeout = TracerProcess._TIMEOUT_SELECT \
-                if timeout_left > TracerProcess._TIMEOUT_SELECT \
-                else timeout_left
-
-            (readable, _, _) = select.select([self.err], [], [], select_timeout)
-            if len(readable) == 0:
-                break
-            lines.extend(itertools.takewhile(lambda line: line != "", readable[0].readlines()))
-            if self.exitcode() is not None:
-                (readable, _, _) = select.select([self.err], [], [], 0)
-                if len(readable) != 0:
-                    lines.extend(itertools.takewhile(lambda line: line != "", readable[0].readlines()))
-                break
-
-        return lines
+        return buf
 
     # override
     def terminate(self):
@@ -285,13 +279,13 @@ class ExecutionController:
         tracer.start()
 
 
-        a = parser.timeout(1).pop_line()
+        a = parser.timeout(0.5).pop_line()
         print(a)
 
         tracee.start_actual_tracee()
 
         while True:
-            a = parser.timeout(1).pop_line()
+            a = parser.timeout(0.1).pop_line()
             if a == None:
                 exit(0)
             print(a)
@@ -338,6 +332,8 @@ class ErrorReporter:
 
 
 class StraceOutputParser:
+    NON_EMPTY_LINES_PATTERN = re.compile(r'(?:^.+$\s)|(?:^.+$)', flags=re.M)
+
     class ERROR_INJECT_WATCHER:
         def __init__(self, syscall, when):
             if when <= 0:
@@ -370,7 +366,7 @@ class StraceOutputParser:
     def __init__(self, tracer):
         self._tracer = tracer
         self._lines = []
-        self._timeout = tracer._TIMEOUT_SELECT
+        self._timeout = 0
         self._watcher = lambda line: True
 
     def timeout(self, new_timeout):
@@ -392,16 +388,18 @@ class StraceOutputParser:
         return None
 
     def has_line(self):
-        return len(self._lines) > 1 or (len(self._lines) == 1 and self._lines[0].endswith('\n'))
+        assert len(self._lines) <= 1 or self._lines[0].endswith('\n')
+        return len(self._lines) >= 1 and self._lines[0].endswith('\n')
 
     def remainder(self):
         return self._lines
 
     # Actual time can be slightly different from that specified in timeout().
-    # timeout() will be necessary only if actual reading strace output is done
+    # timeout() is necessary only if actual reading strace output will be done
     def continue_until_watcher(self):
         clock = time.perf_counter()
         old_timeout = self._timeout
+        timeout_left = self._timeout
         found = False
         while True:
             if self.has_line() and self._watcher(self._lines[0][:-1]):
@@ -412,11 +410,12 @@ class StraceOutputParser:
                 self.pop_line()
                 continue
 
-            self._timeout = old_timeout - (time.perf_counter() - clock)
-            if self._timeout <= 0:
-                break
-
+            self._timeout = timeout_left
             self._more()
+
+            timeout_left = old_timeout - (time.perf_counter() - clock)
+            if timeout_left <= 0:
+                break
 
         self._timeout = old_timeout
         return found
@@ -431,12 +430,13 @@ class StraceOutputParser:
             self._watcher = value
 
     def _more(self):
-        output = self._tracer.readlines(timeout=self._timeout)
-        while len(output) != 0:
-            if len(self._lines) >= 1 and not self._lines[-1].endswith('\n'):
-                self._lines[-1] = self._lines[-1] + output.pop(0)
-            else:
-                self._lines.append(output.pop(0))
+        output = StraceOutputParser.NON_EMPTY_LINES_PATTERN.findall(
+            self._tracer.readbuf(timeout=self._timeout))
+        if len(output) == 0:
+            return
+        if len(self._lines) >= 1 and not self._lines[-1].endswith('\n'):
+            self._lines[-1] = self._lines[-1] + output.pop(0)
+        self._lines.extend(output)
 
 
 if __name__ == '__main__':
