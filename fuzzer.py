@@ -5,6 +5,7 @@ import time
 import select
 import argparse
 import re
+import os.path
 
 
 class ArgvHandler:
@@ -19,6 +20,11 @@ class ArgvHandler:
                             help='arguments of targeted executable')
 
         self._args = parser.parse_args()
+        self._prog = os.path.basename(sys.argv[0])
+
+    @property
+    def prog(self):
+        return self._prog
 
     @property
     def target(self):
@@ -46,10 +52,10 @@ class InjectionGenerator:
 
 
 class AbstractPipeProcess:
-    def __init__(self):
+    def __init__(self, program):
         self.pid = None
         self._exitcode = None
-        (self._r, self._w) = None, None
+        self.prog = program
 
     def start(self):
         raise NotImplementedError
@@ -79,15 +85,15 @@ class AbstractPipeProcess:
         elif os.WIFEXITED(status):
             self._exitcode = os.WEXITSTATUS(status)
 
-    @staticmethod
-    def _say_parent_was_killed():
-        print("fuzzer: main program was terminated", file=sys.stderr)
+    def _say_parent_was_killed(self):
+        print(self.prog + ": main program was terminated", file=sys.stderr)
 
 
 # the bicycle for subprocess.Popen
 class TracerProcess(AbstractPipeProcess):
-    def __init__(self, pid, fault):
-        AbstractPipeProcess.__init__(self)
+    def __init__(self, pid, fault, program):
+        AbstractPipeProcess.__init__(self, program)
+        (self._r, self._w) = None, None
         self._tracee_pid = pid
         self._fault = fault
         self.err = None
@@ -155,16 +161,15 @@ class TracerProcess(AbstractPipeProcess):
         except OSError as exc:
             # It will be send through pipe, if dup2 call was successful
             try:
-                print("fuzzer: cannot run strace: {}".format(exc.strerror), file=sys.stderr)
+                print("cannot run strace: {}".format(exc.strerror), file=sys.stderr)
             except BrokenPipeError:
-                AbstractPipeProcess._say_parent_was_killed()
+                self._say_parent_was_killed()
             exit(1)
 
 
 class TraceeProcess(AbstractPipeProcess):
-    def __init__(self, target, args):
-        AbstractPipeProcess.__init__(self)
-        del (self._w, self._r)
+    def __init__(self, target, args, program):
+        AbstractPipeProcess.__init__(self, program)
         (self._rstart, self._wstart) = None, None
         (self._rwait, self._wwait) = None, None
         self.target = target
@@ -196,40 +201,18 @@ class TraceeProcess(AbstractPipeProcess):
 
         except BrokenPipeError:
             os.close(self._rstart)
-            AbstractPipeProcess._say_parent_was_killed()
-        except OSError as exc:
-            try:
-                os.write(self._wwait, exc.errno.to_bytes(sys.getsizeof(exc.errno), byteorder=sys.byteorder))
-            except BrokenPipeError:
-                AbstractPipeProcess._say_parent_was_killed()
+            self._say_parent_was_killed()
+        except OSError:
+            pass
 
         os.close(self._wwait)
         exit(1)
 
     # call it only after start method and only once
-    # if returns false, calling any method using pipe (e. g. execution_error_msg) is prohibited
     def wait_for_started(self):
         # It cannot be blocked in any way and might execute relatively quickly
         msg = os.read(self._rwait, len(b'wait'))
         return msg == b'wait'
-
-    # TODO this function can be useful for determination of whether tracee cannot be executed
-    # returns error message, if calling os.exec by tracee was unsuccessful
-    # returns None, if os.exec was not called yet
-    # return "", if os.exec was called successfully
-    # if returns not None, calling once again is prohibited
-    def execution_error_msg(self):
-        msg = ""
-        if os.get_blocking(self._rwait):
-            os.set_blocking(self._rwait, False)
-        try:
-            errno_bytes = os.read(self._rwait, sys.getsizeof(int()))
-        except BlockingIOError:
-            return None
-        if len(errno_bytes) != 0:
-            errno = int.from_bytes(errno_bytes, byteorder=sys.byteorder)
-            msg = "fuzzer: cannot run tracee: {}".format(os.strerror(errno))
-        return msg
 
     # call it only once
     def start_actual_tracee(self):
@@ -286,35 +269,54 @@ class ExecutionController:
         self.fault = fault
 
     def start(self):
-        reporter = ErrorReporter(tofile=sys.stderr)
+        reporter = ErrorReporter(tofile=sys.stderr, program=self.args.prog)
 
-        tracee = TraceeProcess(self.args.target, self.args.target_args)
+        tracee = TraceeProcess(target=self.args.target, args=self.args.target_args, program=self.args.prog)
         reporter.watch_tracee(tracee)
 
         tracee.start()
         reporter.handle_event(ErrorReporter.TRACEE_WAIT_FOR_STARTED_EVENT,
                               success=tracee.wait_for_started())
 
-        tracer = TracerProcess(pid=tracee.pid, fault=self.fault)
+        tracer = TracerProcess(pid=tracee.pid, fault=self.fault, program=self.args.prog)
         tracer.set_executable(self.args.strace_executable)
         parser = StraceOutputParser(tracer)
         reporter.watch_tracer(tracer)
 
         tracer.start()
+        # TODO here can be only two possible events:
+        # tracer can terminate and therefore pop_line() will be None
+        # or tracer doesn't terminate, and pop_line() returns not None sooner or later.
         reporter.handle_event(ErrorReporter.TRACER_STARTED_EVENT,
-                              first_line=parser.timeout(0.5).pop_line())
+                              first_line=parser.timeout(1).pop_line())
 
-        parser.add_watcher(name="execve", watcher=StraceOutputParser.REGEX_WATCHER("^execve"))
+        parser.add_watcher(name="start", watcher=StraceOutputParser.REGEX_WATCHER(
+            r'^execve\(\"' + re.escape(tracee.target) +
+            r'", .*\) \= (?P<code>[-]?\d+)(?:$| (?P<errno>\w+) \((?P<strerror>(?:\w|\s)+)\)$)'))
+
         tracee.start_actual_tracee()
-        watchers = parser.continue_until_watchers()
-        print(watchers["execve"].occasion, file=sys.stderr)
+        watchers = parser.timeout(1).continue_until_watchers()
+
+        reporter.handle_event(ErrorReporter.START_ACTUAL_TRACEE_EVENT,
+                              **({"code": int(watchers["start"].matcher.group("code")),
+                                  "strerror": watchers["start"].matcher.group("strerror")}
+                                 if len(watchers) != 0 else {}))
+
+        parser.remove_watcher(name="start")
+        # TODO hardcode
+        parser.add_watcher(name="inject", watcher=StraceOutputParser.ERROR_INJECT_WATCHER("open", 4))
+        watchers = parser.timeout(1).continue_until_watchers()
+        if len(watchers) != 0 and tracee.exitcode() == - signal.SIGSEGV:
+            print(watchers["inject"].occasion, file=sys.stderr)
+            print("Yahooo!", file=sys.stderr)
 
         reporter.unwatch()
         exit(0)
 
 
 class ErrorReporter:
-    def __init__(self, tofile=sys.stderr):
+    def __init__(self, program, tofile=sys.stderr):
+        self.prog = program
         self.tofile = tofile
         self._tracee = None
         self._tracer = None
@@ -342,15 +344,45 @@ class ErrorReporter:
 
     def _tracee_wait_for_started_event(self, success):
         if not success:
-            print("fuzzer: tracee was externally terminated: exitcode {}".
+            print(self.prog + ": tracee was externally terminated: exitcode {}".
                   format(self._tracee.exitcode(blocking=True)), file=self.tofile)
             self._terminate_and_exit()
 
     def _tracer_started_event(self, first_line):
-        return
+        if first_line is None:
+            print(self.prog + ": strace doesn't respond", file=sys.stderr)
+            # code = tracer.exitcode(blocking=True)
+            # if code < 0:
+            #    print(self.prog + ": tracee terminated with signal {}".
+            #          format(signal.Signals(-code).name), file=sys.stderr)
+            # else:
+            #    print(self.prog + ": tracee terminated with exit status {}".
+            #          format(code), file=sys.stderr)
 
-    TRACEE_WAIT_FOR_STARTED_EVENT = _tracee_wait_for_started_event
-    TRACER_STARTED_EVENT = _tracer_started_event
+        elif first_line == self._tracer.executable + ": Process {} attached".format(self._tracee.pid):
+            return
+        elif re.match(r'^cannot run strace: .*$', first_line) \
+                or re.match(r'^' + re.escape(self._tracer.executable) + r': .*$', first_line):
+            print(self.prog + ': ' + first_line, file=sys.stderr)
+
+        else:
+            print(self.prog + ': Unknown error', file=sys.stderr)
+
+        self._terminate_and_exit()
+
+    def _start_actual_tracee(self, code=None, strerror=None):
+        if code is None:
+            print(self.prog + ": actual tracee was not started", file=sys.stderr)
+        elif code == 0:
+            return
+        elif code == -1:
+            print(self.prog + ": cannot run tracee: {}".format(strerror), file=sys.stderr)
+
+        self._terminate_and_exit()
+
+    TRACEE_WAIT_FOR_STARTED_EVENT   = _tracee_wait_for_started_event
+    TRACER_STARTED_EVENT            = _tracer_started_event
+    START_ACTUAL_TRACEE_EVENT       = _start_actual_tracee
 
 
 class StraceOutputParser:
@@ -380,10 +412,16 @@ class StraceOutputParser:
         def __init__(self, regex):
             Watcher.__init__(self)
             self._regex = re.compile(regex)
+            self._matcher = None
 
         @Watcher.watcher_call
         def __call__(self, line):
-            return self._regex.match(line)
+            self._matcher = self._regex.match(line)
+            return self._matcher is not None
+
+        @property
+        def matcher(self):
+            return self._matcher
 
     def __init__(self, tracer):
         self._tracer = tracer
@@ -398,7 +436,6 @@ class StraceOutputParser:
     def pop_line(self):
         line = self.next_line()
         if line is not None:
-            print(line, file=sys.stderr)
             self._lines.pop(0)
         return line
 
@@ -411,7 +448,6 @@ class StraceOutputParser:
         return None
 
     def has_line(self):
-        assert len(self._lines) <= 1 or self._lines[0].endswith('\n')
         return len(self._lines) >= 1 and self._lines[0].endswith('\n')
 
     def remainder(self):
@@ -453,6 +489,10 @@ class StraceOutputParser:
     def remove_watcher(self, name):
         del self._watchers[name]
 
+    @property
+    def watchers(self):
+        return self._watchers
+
     def _more(self):
         output = StraceOutputParser.NON_EMPTY_LINES_PATTERN.findall(
             self._tracer.readbuf(timeout=self._timeout))
@@ -470,58 +510,5 @@ if __name__ == '__main__':
         controller = ExecutionController(argvHandler, fault)
         controller.start()
         continue
-
-        tracee = TraceeProcess(argvHandler.target(), argvHandler.target_args())
-        tracee.start()
-        success = tracee.wait_for_started()
-        if not success:
-            print("fuzzer: tracee was externally terminated: exitcode {}".
-                  format(tracee.exitcode()), file=sys.stderr)
-            exit(1)
-
-        tracer = TracerProcess(pid=tracee.pid, fault=fault)
-        tracer.set_executable(argvHandler.strace_executable())
-        tracer.start()
-        strace_stderr = tracer.readlines(timeout=0.5)
-        for line in strace_stderr:
-            print(line, file=sys.stderr, end='')
-
-        if len(strace_stderr) == 1 and strace_stderr[0].startswith("fuzzer: cannot run strace:"):
-            print(strace_stderr[0], file=sys.stderr, end='')
-            exit(1)
-
-        elif tracer.executable + ": Process {} attached\n".format(tracee.pid) in \
-                strace_stderr:
-            pass
-        else:
-            # TODO add more error handling
-            print("fuzzer: some error occured:\ntracee exitcode: {}\ntracer exitcode: {}"
-                  .format(tracee.exitcode(), tracer.exitcode(), file=sys.stderr))
-
-            tracer.terminate()
-            tracee.terminate()
-            exit(1)
-
-        success = tracee.start_actual_tracee()
-        if not success:
-            print("fuzzer: tracee was externally terminated: exitcode {}".
-                  format(tracee.exitcode()), file=sys.stderr)
-            exit(1)
-
-        # TODO the main branch of further development
-        strace_stderr = tracer.readlines(timeout=1)
-        for line in strace_stderr:
-            print(line, file=sys.stderr, end='')
-
-        time.sleep(1)
-        if tracee.exitcode() == - signal.SIGSEGV:
-            print("Yahoooo!")
-            exit(0)
-
-        tracer.terminate()
-        tracee.terminate()
-        exit(0)
-
-    # end of "for fault in InjectionGenerator():"
 
     exit(0)
