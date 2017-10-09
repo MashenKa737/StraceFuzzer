@@ -100,7 +100,7 @@ class TracerProcess(AbstractPipeProcess):
         # Blocking mode of pipe is used in tracer process in order to guarantee
         # that there is no data loss of strace output, though it may be slower
         # non-blocking mode of pipe is used in parent process
-        # for convenient usage of self.err.readlines().
+        # for convenient usage of self.err.read().
         # Otherwise, we will have to use only low-level os.read
         (self._r, self._w) = os.pipe2(0)
         self.pid = os.fork()
@@ -255,6 +255,32 @@ class TraceeProcess(AbstractPipeProcess):
             self._rwait = None
 
 
+# used as decorator for functions __call__ in all Watcher's successors
+def watcher_call(call):
+    def wrapper(self, line):
+        if self._occasion is not None:
+            return True
+        success = call(self, line)
+        if success:
+            self._occasion = line
+        return success
+
+    return wrapper
+
+
+class Watcher:
+    def __init__(self):
+        self._occasion = None
+
+    @watcher_call
+    def __call__(self, line):
+        return True
+
+    @property
+    def occasion(self):
+        return self._occasion
+
+
 class ExecutionController:
     def __init__(self, args, fault):
         self.args = args
@@ -271,28 +297,21 @@ class ExecutionController:
                               success=tracee.wait_for_started())
 
         tracer = TracerProcess(pid=tracee.pid, fault=self.fault)
+        tracer.set_executable(self.args.strace_executable)
         parser = StraceOutputParser(tracer)
-        parser.watcher = StraceOutputParser.ERROR_INJECT_WATCHER(syscall="open", when=4)
         reporter.watch_tracer(tracer)
 
-        tracer.set_executable(self.args.strace_executable)
         tracer.start()
+        reporter.handle_event(ErrorReporter.TRACER_STARTED_EVENT,
+                              first_line=parser.timeout(0.5).pop_line())
 
-
-        a = parser.timeout(0.5).pop_line()
-        print(a)
-
+        parser.add_watcher(name="execve", watcher=StraceOutputParser.REGEX_WATCHER("^execve"))
         tracee.start_actual_tracee()
+        watchers = parser.continue_until_watchers()
+        print(watchers["execve"].occasion, file=sys.stderr)
 
-        while True:
-            a = parser.timeout(0.1).pop_line()
-            if a == None:
-                exit(0)
-            print(a)
-
-        self.reporter.unwatch()
-
-
+        reporter.unwatch()
+        exit(0)
 
 
 class ErrorReporter:
@@ -322,52 +341,56 @@ class ErrorReporter:
     def handle_event(self, event, **kwargs):
         event(self, **kwargs)
 
-    def _wait_for_started_event(self, success):
+    def _tracee_wait_for_started_event(self, success):
         if not success:
             print("fuzzer: tracee was externally terminated: exitcode {}".
                   format(self._tracee.exitcode(blocking=True)), file=self.tofile)
             self._terminate_and_exit()
 
-    TRACEE_WAIT_FOR_STARTED_EVENT = _wait_for_started_event
+    def _tracer_started_event(self, first_line):
+        return
+
+    TRACEE_WAIT_FOR_STARTED_EVENT = _tracee_wait_for_started_event
+    TRACER_STARTED_EVENT = _tracer_started_event
 
 
 class StraceOutputParser:
     NON_EMPTY_LINES_PATTERN = re.compile(r'(?:^.+$\s)|(?:^.+$)', flags=re.M)
 
-    class ERROR_INJECT_WATCHER:
+    class ERROR_INJECT_WATCHER(Watcher):
         def __init__(self, syscall, when):
+            Watcher.__init__(self)
             if when <= 0:
                 raise ValueError
             self._syscall = syscall
             self._when = when
             self._were = 0
-            self._occasion = None
 
+        @watcher_call
         def __call__(self, line):
-            if self._were == self._when:
-                return True
             if line.startswith(self._syscall):
                 self._were = self._were + 1
-                if self._were == self._when:
-                    self._occasion = line
-                    return True
 
-            return False
+            return self._were == self._when
 
         @property
         def were(self):
             return self._were
 
-        @property
-        def occasion(self):
-            return self._occasion
+    class REGEX_WATCHER(Watcher):
+        def __init__(self, regex):
+            Watcher.__init__(self)
+            self._regex = re.compile(regex)
 
+        @watcher_call
+        def __call__(self, line):
+            return self._regex.match(line)
 
     def __init__(self, tracer):
         self._tracer = tracer
         self._lines = []
         self._timeout = 0
-        self._watcher = lambda line: True
+        self._watchers = {}
 
     def timeout(self, new_timeout):
         self._timeout = new_timeout
@@ -376,6 +399,7 @@ class StraceOutputParser:
     def pop_line(self):
         line = self.next_line()
         if line is not None:
+            print(line, file=sys.stderr)
             self._lines.pop(0)
         return line
 
@@ -396,15 +420,16 @@ class StraceOutputParser:
 
     # Actual time can be slightly different from that specified in timeout().
     # timeout() is necessary only if actual reading strace output will be done
-    def continue_until_watcher(self):
+    def continue_until_watchers(self):
         clock = time.perf_counter()
         old_timeout = self._timeout
         timeout_left = self._timeout
-        found = False
+        watchers_stopped = {}
         while True:
-            if self.has_line() and self._watcher(self._lines[0][:-1]):
-                found = True
-                break
+            if self.has_line():
+                watchers_stopped = {n: w for (n, w) in self._watchers.items() if w(self._lines[0][:-1])}
+                if len(watchers_stopped) != 0:
+                    break
 
             if self.has_line():
                 self.pop_line()
@@ -418,16 +443,16 @@ class StraceOutputParser:
                 break
 
         self._timeout = old_timeout
-        return found
+        return watchers_stopped
 
-    @property
-    def watcher(self):
-        return self._watcher
+    def add_watcher(self, name, watcher):
+        if not isinstance(watcher, Watcher):
+            return
 
-    @watcher.setter
-    def watcher(self, value):
-        if self._watcher is None:
-            self._watcher = value
+        self._watchers[name] = watcher
+
+    def remove_watcher(self, name):
+        del self._watchers[name]
 
     def _more(self):
         output = StraceOutputParser.NON_EMPTY_LINES_PATTERN.findall(
