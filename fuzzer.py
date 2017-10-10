@@ -39,6 +39,28 @@ class ArgvHandler:
         return self._args.args
 
 
+class Fault:
+    def __init__(self, syscall: str, error: str, when: int):
+        self._syscall = syscall
+        self._error = error
+        self._when = when
+
+    @property
+    def syscall(self):
+        return self._syscall
+
+    @property
+    def error(self):
+        return self._error
+
+    @property
+    def when(self):
+        return self._when
+
+    def __str__(self):
+        return "fault=" + self._syscall + ":error=" + self._error + ":when=" + str(self._when)
+
+
 # should be linked with other part of project in any way
 class InjectionGenerator:
     def __init__(self):
@@ -48,7 +70,7 @@ class InjectionGenerator:
         return self
 
     def __next__(self):
-        return "fault=open:error=ENOENT:when=4"
+        return Fault(syscall="open", error="ENOENT", when=4)
 
 
 class AbstractPipeProcess:
@@ -98,7 +120,7 @@ class TracerProcess(AbstractPipeProcess):
         self._fault = fault
         self.err = None
         self.executable = 'strace'
-        self.args = "-p", str(self._tracee_pid), "-e", self._fault
+        self.args = "-p", str(self._tracee_pid), "-e", str(self._fault)
 
     # call it only once
     # override
@@ -303,8 +325,8 @@ class ExecutionController:
                                  if len(watchers) != 0 else {}))
 
         parser.remove_watcher(name="start")
-        # TODO hardcode
-        parser.add_watcher(name="inject", watcher=StraceOutputParser.ERROR_INJECT_WATCHER("open", 4))
+        parser.add_watcher(name="inject",
+                           watcher=StraceOutputParser.ERROR_INJECT_WATCHER(fault.syscall, fault.when))
         watchers = parser.timeout(1).continue_until_watchers()
         if len(watchers) != 0 and tracee.exitcode() == - signal.SIGSEGV:
             print(watchers["inject"].occasion, file=sys.stderr)
