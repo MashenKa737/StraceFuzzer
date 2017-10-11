@@ -362,8 +362,17 @@ class ExecutionController:
         previous_were = parser.watchers["inject"].were
         while True:
             watchers = parser.continue_until_watchers()
-            if len(watchers) != 0 and self._tracee.exitcode() == - signal.SIGSEGV:
-                self._succ_injections.append(fault=self.fault, context=watchers["inject"].occasion)
+            if len(watchers) != 0:
+                syscall = watchers["inject"].occasion
+                parser.remove_watcher(name="inject")
+                parser.add_watcher(name="sigsegv", watcher=StraceOutputParser.REGEX_WATCHER(
+                    r'^\+{3} killed by SIGSEGV \(core dumped\) \+{3}'))
+
+                watchers = parser.continue_until_watchers()
+                if len(watchers) != 0:
+                    assert self._tracee.exitcode(blocking=True) == - signal.SIGSEGV
+                    self._succ_injections.append(fault=self.fault, context=syscall)
+
                 break
 
             if len(watchers) == 0 and parser.watchers["inject"].were == previous_were:
