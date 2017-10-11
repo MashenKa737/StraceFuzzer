@@ -310,12 +310,16 @@ class ExecutionController:
     def __init__(self, args, fault, tolist, reporter, aterror):
         self.args = args
         self.fault = fault
+        self.maximal_time_wait = 1
         self._reporter = reporter
         self._reporter.set_aterror(self.finish_with_error)
         self._succ_injections = tolist
         self._aterror = aterror
         self._tracee = None
         self._tracer = None
+
+    def set_maximal_time_wait(self, new_mtw):
+        self.maximal_time_wait = new_mtw
 
     def execute(self):
         self._tracee = TraceeProcess(target=self.args.target, args=self.args.target_args, program=self.args.prog)
@@ -328,6 +332,8 @@ class ExecutionController:
         self._tracer = TracerProcess(pid=self._tracee.pid, fault=self.fault, program=self.args.prog)
         self._tracer.set_executable(self.args.strace_executable)
         parser = StraceOutputParser(self._tracer)
+        parser.set_maximal_timestep(0.1)
+        parser.timeout(self.maximal_time_wait)
         self._reporter.watch_tracer(self._tracer)
 
         self._tracer.start()
@@ -335,14 +341,14 @@ class ExecutionController:
         # tracer can terminate and therefore pop_line() will be None
         # or tracer doesn't terminate, and pop_line() returns not None sooner or later.
         self._reporter.handle_event(self._reporter.TRACER_STARTED_EVENT,
-                                    first_line=parser.timeout(1).pop_line())
+                                    first_line=parser.pop_line())
 
         parser.add_watcher(name="start", watcher=StraceOutputParser.REGEX_WATCHER(
             r'^execve\(\"' + re.escape(self._tracee.target) +
             r'", .*\) \= (?P<code>[-]?\d+)(?:$| (?P<errno>\w+) \((?P<strerror>(?:\w|\s)+)\)$)'))
 
         self._tracee.start_actual_tracee()
-        watchers = parser.timeout(1).continue_until_watchers()
+        watchers = parser.continue_until_watchers()
 
         self._reporter.handle_event(self._reporter.START_ACTUAL_TRACEE_EVENT,
                                     **({"code": int(watchers["start"].matcher.group("code")),
@@ -355,7 +361,7 @@ class ExecutionController:
 
         previous_were = parser.watchers["inject"].were
         while True:
-            watchers = parser.timeout(1).continue_until_watchers()
+            watchers = parser.continue_until_watchers()
             if len(watchers) != 0 and self._tracee.exitcode() == - signal.SIGSEGV:
                 self._succ_injections.append(fault=self.fault, context=watchers["inject"].occasion)
                 break
@@ -539,10 +545,14 @@ class StraceOutputParser:
         self._lines = []
         self._timeout = 0
         self._watchers = {}
+        self.maximal_timestep = 0
 
     def timeout(self, new_timeout):
         self._timeout = new_timeout
         return self
+
+    def set_maximal_timestep(self, new_tmstp):
+        self.maximal_timestep = new_tmstp
 
     def pop_line(self):
         line = self.next_line()
@@ -605,13 +615,25 @@ class StraceOutputParser:
         return self._watchers
 
     def _more(self):
-        output = StraceOutputParser.NON_EMPTY_LINES_PATTERN.findall(
-            self._tracer.readbuf(timeout=self._timeout))
-        if len(output) == 0:
-            return
-        if len(self._lines) >= 1 and not self._lines[-1].endswith('\n'):
-            self._lines[-1] = self._lines[-1] + output.pop(0)
-        self._lines.extend(output)
+        timeout_left = self._timeout
+        clock = time.perf_counter()
+        while True:
+            timeout_left = min(timeout_left, self.maximal_timestep)
+            output = StraceOutputParser.NON_EMPTY_LINES_PATTERN.findall(
+                self._tracer.readbuf(timeout=timeout_left))
+
+            timeout_left = self._timeout - (time.perf_counter() - clock)
+
+            if len(output) != 0:
+                new_line = len(output) > 1 or output[0].endswith('\n')
+                if len(self._lines) >= 1 and not self._lines[-1].endswith('\n'):
+                    self._lines[-1] = self._lines[-1] + output.pop(0)
+                self._lines.extend(output)
+                if new_line:
+                    return
+
+            if timeout_left <= 0:
+                return
 
 
 if __name__ == '__main__':
