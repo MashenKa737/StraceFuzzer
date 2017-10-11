@@ -6,6 +6,7 @@ import select
 import argparse
 import re
 import os.path
+import io
 
 
 class ArgvHandler:
@@ -13,7 +14,12 @@ class ArgvHandler:
         parser = argparse.ArgumentParser(description="injects errors into syscalls of targeted executable",
                                          allow_abbrev=False)
         parser.add_argument('-s', '--strace', action='store', default='strace',
-                            help='path to strace executable', dest='strace_executable')
+                            help='path to strace executable', metavar='strace_executable', dest='strace_executable')
+
+        parser.add_argument('-o', action='store', default=sys.stderr, type=argparse.FileType(mode='wt'),
+                            help='write the %(prog)s output to the file "%(metavar)s" rather then to stderr',
+                            metavar='filename', dest='file')
+
         parser.add_argument('target', action='store', help='targeted executable')
 
         parser.add_argument('args', action='store', nargs=argparse.REMAINDER,
@@ -37,6 +43,10 @@ class ArgvHandler:
     @property
     def target_args(self):
         return self._args.args
+
+    @property
+    def output_file(self):
+        return self._args.file
 
 
 class Fault:
@@ -67,13 +77,17 @@ class Fault:
 # should be linked with other part of project in any way
 class InjectionGenerator:
     def __init__(self):
-        pass
+        self._generated = False
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        return Fault(syscall="open", error="ENOENT", when=4)
+        if not self._generated:
+            self._generated = True
+            return Fault(syscall="open", error="ENOENT", when=4)
+
+        raise StopIteration
 
 
 class AbstractPipeProcess:
@@ -293,54 +307,79 @@ class Watcher:
 
 
 class ExecutionController:
-    def __init__(self, args, fault):
+    def __init__(self, args, fault, tolist, reporter, aterror):
         self.args = args
         self.fault = fault
+        self._reporter = reporter
+        self._reporter.set_aterror(self.finish_with_error)
+        self._succ_injections = tolist
+        self._aterror = aterror
+        self._tracee = None
+        self._tracer = None
 
-    def start(self):
-        reporter = ErrorReporter(tofile=sys.stderr, program=self.args.prog)
+    def execute(self):
+        self._tracee = TraceeProcess(target=self.args.target, args=self.args.target_args, program=self.args.prog)
+        self._reporter.watch_tracee(self._tracee)
 
-        tracee = TraceeProcess(target=self.args.target, args=self.args.target_args, program=self.args.prog)
-        reporter.watch_tracee(tracee)
+        self._tracee.start()
+        self._reporter.handle_event(self._reporter.TRACEE_WAIT_FOR_STARTED_EVENT,
+                                    success=self._tracee.wait_for_started())
 
-        tracee.start()
-        reporter.handle_event(ErrorReporter.TRACEE_WAIT_FOR_STARTED_EVENT,
-                              success=tracee.wait_for_started())
+        self._tracer = TracerProcess(pid=self._tracee.pid, fault=self.fault, program=self.args.prog)
+        self._tracer.set_executable(self.args.strace_executable)
+        parser = StraceOutputParser(self._tracer)
+        self._reporter.watch_tracer(self._tracer)
 
-        tracer = TracerProcess(pid=tracee.pid, fault=self.fault, program=self.args.prog)
-        tracer.set_executable(self.args.strace_executable)
-        parser = StraceOutputParser(tracer)
-        reporter.watch_tracer(tracer)
-
-        tracer.start()
+        self._tracer.start()
         # TODO here can be only two possible events:
         # tracer can terminate and therefore pop_line() will be None
         # or tracer doesn't terminate, and pop_line() returns not None sooner or later.
-        reporter.handle_event(ErrorReporter.TRACER_STARTED_EVENT,
-                              first_line=parser.timeout(1).pop_line())
+        self._reporter.handle_event(self._reporter.TRACER_STARTED_EVENT,
+                                    first_line=parser.timeout(1).pop_line())
 
         parser.add_watcher(name="start", watcher=StraceOutputParser.REGEX_WATCHER(
-            r'^execve\(\"' + re.escape(tracee.target) +
+            r'^execve\(\"' + re.escape(self._tracee.target) +
             r'", .*\) \= (?P<code>[-]?\d+)(?:$| (?P<errno>\w+) \((?P<strerror>(?:\w|\s)+)\)$)'))
 
-        tracee.start_actual_tracee()
+        self._tracee.start_actual_tracee()
         watchers = parser.timeout(1).continue_until_watchers()
 
-        reporter.handle_event(ErrorReporter.START_ACTUAL_TRACEE_EVENT,
-                              **({"code": int(watchers["start"].matcher.group("code")),
-                                  "strerror": watchers["start"].matcher.group("strerror")}
-                                 if len(watchers) != 0 else {}))
+        self._reporter.handle_event(self._reporter.START_ACTUAL_TRACEE_EVENT,
+                                    **({"code": int(watchers["start"].matcher.group("code")),
+                                        "strerror": watchers["start"].matcher.group("strerror")}
+                                       if len(watchers) != 0 else {}))
 
         parser.remove_watcher(name="start")
         parser.add_watcher(name="inject",
-                           watcher=StraceOutputParser.ERROR_INJECT_WATCHER(fault.syscall, fault.when))
-        watchers = parser.timeout(1).continue_until_watchers()
-        if len(watchers) != 0 and tracee.exitcode() == - signal.SIGSEGV:
-            print(watchers["inject"].occasion, file=sys.stderr)
-            print("Yahooo!", file=sys.stderr)
+                           watcher=StraceOutputParser.ERROR_INJECT_WATCHER(self.fault.syscall, self.fault.when))
 
-        reporter.unwatch()
-        exit(0)
+        previous_were = parser.watchers["inject"].were
+        while True:
+            watchers = parser.timeout(1).continue_until_watchers()
+            if len(watchers) != 0 and self._tracee.exitcode() == - signal.SIGSEGV:
+                self._succ_injections.append(fault=self.fault, context=watchers["inject"].occasion)
+                break
+
+            if len(watchers) == 0 and parser.watchers["inject"].were == previous_were:
+                break
+
+            previous_were = parser.watchers["inject"].were
+
+        self.terminate_all()
+
+    def finish_with_error(self):
+        self.terminate_all()
+        self._reporter.set_aterror(None)
+        self._aterror()
+        assert False  # self._aterror() should end execution
+
+    def terminate_all(self):
+        if self._tracee is not None:
+            self._tracee.terminate()
+        if self._tracer is not None:
+            self._tracer.terminate()
+        self._tracee = None
+        self._tracer = None
 
 
 class ListSuccessfulInjections:
@@ -357,9 +396,8 @@ class ListSuccessfulInjections:
         else:
             self._output = output
 
-    def add_entry(self, fault: Fault, context: str):
+    def append(self, fault: Fault, context: str):
         self._entries.append(dict(fault=fault, context=context))
-        self.print()
 
     def print(self):
         if not self._header_printed:
@@ -379,6 +417,9 @@ class ListSuccessfulInjections:
         self.print()
         print(self._tail, file=self._output)
 
+    def is_empty(self):
+        return len(self._entries) == 0
+
 
 class ErrorReporter:
     def __init__(self, program, tofile=sys.stderr):
@@ -386,6 +427,7 @@ class ErrorReporter:
         self.tofile = tofile
         self._tracee = None
         self._tracer = None
+        self._aterror = None
 
     def watch_tracee(self, tracee):
         self._tracee = tracee
@@ -397,26 +439,29 @@ class ErrorReporter:
         self._tracee = None
         self._tracee = None
 
-    def _terminate_and_exit(self):
-        if self._tracee is not None:
-            self._tracee.terminate()
-        if self._tracer is not None:
-            self._tracer.terminate()
-        self.unwatch()
-        exit(1)
+    def set_aterror(self, aterror):
+        self._aterror = aterror
 
-    def handle_event(self, event, **kwargs):
-        event(self, **kwargs)
+    def _handle_error(self):
+        self.unwatch()
+        if self._aterror is not None:
+            self._aterror()
+        return False
+
+    @staticmethod
+    def handle_event(event, **kwargs):
+        event(**kwargs)
 
     def _tracee_wait_for_started_event(self, success):
         if not success:
             print(self.prog + ": tracee was externally terminated: exitcode {}".
                   format(self._tracee.exitcode(blocking=True)), file=self.tofile)
-            self._terminate_and_exit()
+            return self._handle_error()
+        return True
 
     def _tracer_started_event(self, first_line):
         if first_line is None:
-            print(self.prog + ": strace doesn't respond", file=sys.stderr)
+            print(self.prog + ": strace doesn't respond", file=self.tofile)
             # code = tracer.exitcode(blocking=True)
             # if code < 0:
             #    print(self.prog + ": tracee terminated with signal {}".
@@ -426,25 +471,25 @@ class ErrorReporter:
             #          format(code), file=sys.stderr)
 
         elif first_line == self._tracer.executable + ": Process {} attached".format(self._tracee.pid):
-            return
+            return True
         elif re.match(r'^cannot run strace: .*$', first_line) \
                 or re.match(r'^' + re.escape(self._tracer.executable) + r': .*$', first_line):
-            print(self.prog + ': ' + first_line, file=sys.stderr)
+            print(self.prog + ': ' + first_line, file=self.tofile)
 
         else:
-            print(self.prog + ': Unknown error', file=sys.stderr)
+            print(self.prog + ': Unknown error', file=self.tofile)
 
-        self._terminate_and_exit()
+        return self._handle_error()
 
     def _start_actual_tracee(self, code=None, strerror=None):
         if code is None:
-            print(self.prog + ": actual tracee was not started", file=sys.stderr)
+            print(self.prog + ": actual tracee was not started", file=self.tofile)
         elif code == 0:
-            return
+            return True
         elif code == -1:
-            print(self.prog + ": cannot run tracee: {}".format(strerror), file=sys.stderr)
+            print(self.prog + ": cannot run tracee: {}".format(strerror), file=self.tofile)
 
-        self._terminate_and_exit()
+        return self._handle_error()
 
     TRACEE_WAIT_FOR_STARTED_EVENT   = _tracee_wait_for_started_event
     TRACER_STARTED_EVENT            = _tracer_started_event
@@ -571,10 +616,24 @@ class StraceOutputParser:
 
 if __name__ == '__main__':
     argvHandler = ArgvHandler()
+    listSuccessfulInjections = ListSuccessfulInjections(output=argvHandler.output_file)
+
+    error_reporter_output = io.StringIO()
+    errorReporter = ErrorReporter(tofile=error_reporter_output, program=argvHandler.prog)
+
+    def print_all_and_exit():
+        if not listSuccessfulInjections.is_empty():
+            listSuccessfulInjections.print_until_end()
+        print(error_reporter_output.getvalue(), file=sys.stderr, end='')
+        exit(1)
 
     for fault in InjectionGenerator():
-        controller = ExecutionController(argvHandler, fault)
-        controller.start()
-        continue
+        controller = ExecutionController(args=argvHandler, fault=fault,
+                                         tolist=listSuccessfulInjections,
+                                         reporter=errorReporter,
+                                         aterror=print_all_and_exit)
+        controller.execute()
 
+    if not listSuccessfulInjections.is_empty():
+        listSuccessfulInjections.print_until_end()
     exit(0)
