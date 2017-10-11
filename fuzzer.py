@@ -265,21 +265,25 @@ class TraceeProcess(AbstractPipeProcess):
 
 class Watcher:
     # used as decorator for functions __call__ in all Watcher's successors
-    def watcher_call(call):
-        def wrapper(self, line):
-            if self._occasion is not None:
-                return True
-            success = call(self, line)
-            if success:
-                self._occasion = line
-            return success
+    class watcher_call:
+        def __init__(self):
+            pass
 
-        return wrapper
+        def __call__(self, call):
+            def wrapper(self, line):
+                if self._occasion is not None:
+                    return True
+                success = call(self, line)
+                if success:
+                    self._occasion = line
+                return success
+
+            return wrapper
 
     def __init__(self):
         self._occasion = None
 
-    @watcher_call
+    @watcher_call()
     def __call__(self, line):
         return True
 
@@ -459,7 +463,7 @@ class StraceOutputParser:
             self._when = when
             self._were = 0
 
-        @Watcher.watcher_call
+        @Watcher.watcher_call()
         def __call__(self, line):
             if line.startswith(self._syscall):
                 self._were = self._were + 1
@@ -476,7 +480,7 @@ class StraceOutputParser:
             self._regex = re.compile(regex)
             self._matcher = None
 
-        @Watcher.watcher_call
+        @Watcher.watcher_call()
         def __call__(self, line):
             self._matcher = self._regex.match(line)
             return self._matcher is not None
