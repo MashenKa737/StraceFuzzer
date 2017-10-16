@@ -15,30 +15,30 @@ class ExecutionController:
         self._reporter = reporter
         self._reporter.set_aterror(self.finish_with_error)
         self._aterror = aterror
-        self._tracee = None
-        self._tracer = None
-        self._parser = None
+
+        self._tracee = TraceeProcess(target=self.args["target"], args=self.args["target_args"],
+                                     program=self.args["program_name"])
+        self._tracer = TracerProcess(pid=None, args=self.args["strace_args"],
+                                     program=self.args["program_name"])
+        self._tracer.set_executable(self.args["strace_executable"])
+
+        self._reporter.watch_tracee(self._tracee)
+        self._reporter.watch_tracer(self._tracer)
+
+        self._parser = StraceOutputParser(self._tracer)
+        self._parser.set_maximal_timestep(0.1)
+        self._parser.timeout(self.maximal_time_wait)
 
     def set_maximal_time_wait(self, new_mtw):
         self.maximal_time_wait = new_mtw
+        self._parser.timeout(self.maximal_time_wait)
 
     def start_processes(self):
-        self._tracee = TraceeProcess(target=self.args["target"], args=self.args["target_args"],
-                                     program=self.args["program_name"])
-        self._reporter.watch_tracee(self._tracee)
-
         self._tracee.start()
         self._reporter.handle_event(self._reporter.TRACEE_WAIT_FOR_STARTED_EVENT,
                                     success=self._tracee.wait_for_started())
 
-        self._tracer = TracerProcess(pid=self._tracee.pid, args=self.args["strace_args"],
-                                     program=self.args["program_name"])
-        self._tracer.set_executable(self.args["strace_executable"])
-        self._parser = StraceOutputParser(self._tracer)
-        self._parser.set_maximal_timestep(0.1)
-        self._parser.timeout(self.maximal_time_wait)
-        self._reporter.watch_tracer(self._tracer)
-
+        self._tracer.set_tracee_pid(self._tracee.pid)
         self._tracer.start()
         # TODO here can be only two possible events:
         # tracer can terminate and therefore pop_line() will be None

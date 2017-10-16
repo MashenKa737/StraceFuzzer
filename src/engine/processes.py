@@ -52,7 +52,7 @@ class TracerProcess(AbstractPipeProcess):
         self._strace_args = args
         self.err = None
         self.executable = 'strace'
-        self.args = "-p", str(self._tracee_pid), *self._strace_args
+        self.args = None
 
     # call it only once
     # override
@@ -62,6 +62,7 @@ class TracerProcess(AbstractPipeProcess):
         # non-blocking mode of pipe is used in parent process
         # for convenient usage of self.err.read().
         # Otherwise, we will have to use only low-level os.read
+        self.args = "-p", str(self._tracee_pid), *self._strace_args
         (self._r, self._w) = os.pipe2(0)
         self.pid = os.fork()
         if self.pid == 0:
@@ -74,6 +75,9 @@ class TracerProcess(AbstractPipeProcess):
 
     def set_executable(self, executable):
         self.executable = executable
+
+    def set_tracee_pid(self, pid: int):
+        self._tracee_pid = pid
 
     def readbuf(self, timeout):
         buf = str()

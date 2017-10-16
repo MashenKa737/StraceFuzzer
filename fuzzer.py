@@ -58,14 +58,15 @@ class ArgvHandler:
 # should be linked with other part of project in any way
 class InjectionGenerator:
     def __init__(self):
-        self._generated = False
+        self._num = 0
+        self._max = 5
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if not self._generated:
-            self._generated = True
+        if self._num < self._max:
+            self._num += 1
             return Fault(syscall="open", error="ENOENT", when=4)
 
         raise StopIteration
@@ -84,11 +85,14 @@ if __name__ == '__main__':
         print(error_reporter_output.getvalue(), file=sys.stderr, end='')
         exit(1)
 
-    for fault in InjectionGenerator():
-        controller = InjectionExecutionController(reporter=errorReporter, aterror=print_all_and_exit,
-                                                  fault=fault, general_args=argvHandler.all_properties,
-                                                  tolist=listSuccessfulInjections)
-        controller.execute()
+    try:
+        for fault in InjectionGenerator():
+            controller = InjectionExecutionController(reporter=errorReporter, aterror=print_all_and_exit,
+                                                      fault=fault, general_args=argvHandler.all_properties,
+                                                      tolist=listSuccessfulInjections)
+            controller.execute()
+    except KeyboardInterrupt:
+        pass
 
     if not listSuccessfulInjections.is_empty():
         listSuccessfulInjections.print_until_end()
