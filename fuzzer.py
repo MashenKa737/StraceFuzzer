@@ -4,7 +4,7 @@ import os
 import os.path
 import sys
 
-from src.engine.controllers import ExecutionController
+from src.engine.controllers import InjectionExecutionController
 from src.engine.reporters import ErrorReporter
 from src.model.fault import Fault
 from src.utils.injection_writer import ListSuccessfulInjections
@@ -27,11 +27,11 @@ class ArgvHandler:
                             help='arguments of targeted executable')
 
         self._args = parser.parse_args()
-        self._prog = os.path.basename(sys.argv[0])
+        self._program_name = os.path.basename(sys.argv[0])
 
     @property
-    def prog(self):
-        return self._prog
+    def program_name(self):
+        return self._program_name
 
     @property
     def target(self):
@@ -48,6 +48,11 @@ class ArgvHandler:
     @property
     def output_file(self):
         return self._args.file
+
+    @property
+    def all_properties(self):
+        return dict(program_name=self.program_name, output_file=self.output_file, target=self.target,
+                    strace_executable=self.strace_executable, target_args=self.target_args)
 
 
 # should be linked with other part of project in any way
@@ -71,7 +76,7 @@ if __name__ == '__main__':
     listSuccessfulInjections = ListSuccessfulInjections(output=argvHandler.output_file)
 
     error_reporter_output = io.StringIO()
-    errorReporter = ErrorReporter(tofile=error_reporter_output, program=argvHandler.prog)
+    errorReporter = ErrorReporter(tofile=error_reporter_output, program=argvHandler.program_name)
 
     def print_all_and_exit():
         if not listSuccessfulInjections.is_empty():
@@ -80,10 +85,9 @@ if __name__ == '__main__':
         exit(1)
 
     for fault in InjectionGenerator():
-        controller = ExecutionController(args=argvHandler, fault=fault,
-                                         tolist=listSuccessfulInjections,
-                                         reporter=errorReporter,
-                                         aterror=print_all_and_exit)
+        controller = InjectionExecutionController(reporter=errorReporter, aterror=print_all_and_exit,
+                                                  fault=fault, general_args=argvHandler.all_properties,
+                                                  tolist=listSuccessfulInjections)
         controller.execute()
 
     if not listSuccessfulInjections.is_empty():

@@ -45,14 +45,14 @@ class AbstractPipeProcess:
 
 # the bicycle for subprocess.Popen
 class TracerProcess(AbstractPipeProcess):
-    def __init__(self, pid, fault, program):
+    def __init__(self, pid, args, program):
         AbstractPipeProcess.__init__(self, program)
         (self._r, self._w) = None, None
         self._tracee_pid = pid
-        self._fault = fault
+        self._strace_args = args
         self.err = None
         self.executable = 'strace'
-        self.args = "-p", str(self._tracee_pid), "-e", str(self._fault)
+        self.args = "-p", str(self._tracee_pid), *self._strace_args
 
     # call it only once
     # override
