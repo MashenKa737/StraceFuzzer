@@ -115,7 +115,7 @@ class TracerProcess(AbstractPipeProcess):
         try:
             os.dup2(self._w, sys.stderr.fileno())
             os.close(self._w)
-            os.execlp(self.executable, self.executable, *self.args)
+            os.execl(self.executable, self.executable, *self.args)
         except OSError as exc:
             # It will be send through pipe, if dup2 call was successful
             try:
@@ -155,7 +155,7 @@ class TraceeProcess(AbstractPipeProcess):
             msg = os.read(self._rstart, len(b'start'))
             os.close(self._rstart)
             if msg == b'start':
-                os.execlp(self.target, self.target, *self.args)
+                os.execl(self.target, self.target, *self.args)
 
         except BrokenPipeError:
             os.close(self._rstart)

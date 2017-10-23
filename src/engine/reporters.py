@@ -72,6 +72,7 @@ class ErrorReporter:
 
         return self._handle_error()
 
+    # TODO and checking for signals and syscall resuming
     def _strace_output_not_syscall_event(self, line=None):
         if line is None:
             return True
