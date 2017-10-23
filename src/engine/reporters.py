@@ -62,7 +62,7 @@ class ErrorReporter:
 
         return self._handle_error()
 
-    def _start_actual_tracee(self, code=None, strerror=None):
+    def _start_actual_tracee_event(self, code=None, strerror=None):
         if code is None:
             print(self.prog + ": actual tracee was not started", file=self.tofile)
         elif code == 0:
@@ -72,6 +72,16 @@ class ErrorReporter:
 
         return self._handle_error()
 
+    def _strace_output_not_syscall_event(self, line=None):
+        if line is None:
+            return True
+        if re.match(r'^\+{3} (killed by .+|exited with \d+) \+{3}$', line):
+            return True
+
+        print(self.prog + ': Unexpected strace output line: ' + line, file=self.tofile)
+        return self._handle_error()
+
     TRACEE_WAIT_FOR_STARTED_EVENT   = _tracee_wait_for_started_event
     TRACER_STARTED_EVENT            = _tracer_started_event
-    START_ACTUAL_TRACEE_EVENT       = _start_actual_tracee
+    START_ACTUAL_TRACEE_EVENT       = _start_actual_tracee_event
+    STRACE_OUTPUT_NOT_SYSCALL_EVENT = _strace_output_not_syscall_event

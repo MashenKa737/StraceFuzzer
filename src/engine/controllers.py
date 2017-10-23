@@ -9,9 +9,12 @@ from src.utils.injection_writer import ListSuccessfulInjections
 
 
 class ExecutionController:
+    MAXIMAL_TIME_WAIT_ON_START_PROCESSES = 10
+
     def __init__(self, reporter: ErrorReporter, aterror, processes_args: dict):
         self.args = processes_args
         self.maximal_time_wait = 1
+        self._listDroppedSyscalls = []
         self._reporter = reporter
         self._reporter.set_aterror(self.finish_with_error)
         self._aterror = aterror
@@ -34,6 +37,8 @@ class ExecutionController:
         self._parser.timeout(self.maximal_time_wait)
 
     def start_processes(self):
+        self._parser.timeout(ExecutionController.MAXIMAL_TIME_WAIT_ON_START_PROCESSES)
+
         self._tracee.start()
         self._reporter.handle_event(self._reporter.TRACEE_WAIT_FOR_STARTED_EVENT,
                                     success=self._tracee.wait_for_started())
@@ -46,6 +51,7 @@ class ExecutionController:
         self._reporter.handle_event(self._reporter.TRACER_STARTED_EVENT,
                                     first_line=self._parser.pop_line())
 
+        self._parser.add_watcher(name="drop", watcher=StraceOutputParser.REMEMBER_SYSCALLS_WATCHER())
         self._parser.add_watcher(name="start", watcher=StraceOutputParser.REGEX_WATCHER(
             r'^execve\(\"' + re.escape(self._tracee.target) +
             r'", .*\) \= (?P<code>[-]?\d+)(?:$| (?P<errno>\w+) \((?P<strerror>(?:\w|\s)+)\)$)'))
@@ -53,13 +59,24 @@ class ExecutionController:
         self._tracee.start_actual_tracee()
         watchers = self._parser.continue_until_watchers()
 
+        self._reporter.handle_event(self._reporter.STRACE_OUTPUT_NOT_SYSCALL_EVENT,
+                                    line=watchers["drop"].occasion if "drop" in watchers else None)
+
         self._reporter.handle_event(self._reporter.START_ACTUAL_TRACEE_EVENT,
                                     **({"code": int(watchers["start"].matcher.group("code")),
                                         "strerror": watchers["start"].matcher.group("strerror")}
-                                       if len(watchers) != 0 else {}))
+                                       if "start" in watchers else {}))
 
+        self._parser.pop_line()
+        self._listDroppedSyscalls = self._parser.watchers["drop"].list_syscalls
+        self._parser.remove_watcher(name="drop")
         self._parser.remove_watcher(name="start")
+        self._parser.timeout(self.maximal_time_wait)
         # here can and should be successive watching for strace output
+
+    @property
+    def list_dropped_syscalls(self):
+        return self._listDroppedSyscalls
 
     def finish_with_error(self):
         self.terminate_all()
@@ -97,7 +114,7 @@ class InjectionExecutionController(ExecutionController):
                 syscall = watchers["inject"].occasion
                 self._parser.remove_watcher(name="inject")
                 self._parser.add_watcher(name="sigsegv", watcher=StraceOutputParser.REGEX_WATCHER(
-                    r'^\+{3} killed by SIGSEGV \(core dumped\) \+{3}'))
+                    r'^\+{3} killed by SIGSEGV \(core dumped\) \+{3}$'))
 
                 watchers = self._parser.continue_until_watchers()
                 if len(watchers) != 0:
@@ -112,3 +129,26 @@ class InjectionExecutionController(ExecutionController):
             previous_were = self._parser.watchers["inject"].were
 
         self.terminate_all()
+
+
+class GeneratorExecutionController(ExecutionController):
+    def __init__(self, reporter: ErrorReporter, aterror, general_args: dict):
+        general_args["strace_args"] = []
+        super().__init__(reporter=reporter, aterror=aterror, processes_args=general_args)
+        self._list_syscalls = []
+
+    def execute(self):
+        self.start_processes()
+        self._parser.add_watcher(name="counter", watcher=StraceOutputParser.REMEMBER_SYSCALLS_WATCHER())
+
+        watchers = self._parser.continue_until_watchers()
+        self._reporter.handle_event(self._reporter.STRACE_OUTPUT_NOT_SYSCALL_EVENT,
+                                    line=watchers["counter"].occasion if "counter" in watchers else None)
+
+        self._list_syscalls = self._parser.watchers["counter"].list_syscalls
+        self._parser.remove_watcher("counter")
+        self.terminate_all()
+
+    @property
+    def list_syscalls(self):
+        return self._list_syscalls

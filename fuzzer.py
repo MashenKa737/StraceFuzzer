@@ -6,7 +6,7 @@ import sys
 
 from src.engine.controllers import InjectionExecutionController
 from src.engine.reporters import ErrorReporter
-from src.model.fault import Fault
+from src.engine.generator import InjectionGenerator
 from src.utils.injection_writer import ListSuccessfulInjections
 
 
@@ -55,23 +55,6 @@ class ArgvHandler:
                     strace_executable=self.strace_executable, target_args=self.target_args)
 
 
-# should be linked with other part of project in any way
-class InjectionGenerator:
-    def __init__(self):
-        self._num = 0
-        self._max = 5
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self._num < self._max:
-            self._num += 1
-            return Fault(syscall="open", error="ENOENT", when=4)
-
-        raise StopIteration
-
-
 if __name__ == '__main__':
     argvHandler = ArgvHandler()
     listSuccessfulInjections = ListSuccessfulInjections(output=argvHandler.output_file)
@@ -86,7 +69,10 @@ if __name__ == '__main__':
         exit(1)
 
     try:
-        for fault in InjectionGenerator():
+        injectionGenerator = InjectionGenerator(reporter=errorReporter, aterror=print_all_and_exit,
+                                                general_args=argvHandler.all_properties)
+
+        for fault in injectionGenerator:
             controller = InjectionExecutionController(reporter=errorReporter, aterror=print_all_and_exit,
                                                       fault=fault, general_args=argvHandler.all_properties,
                                                       tolist=listSuccessfulInjections)

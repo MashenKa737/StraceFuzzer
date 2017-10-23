@@ -69,6 +69,32 @@ class StraceOutputParser:
         def matcher(self):
             return self._matcher
 
+    class REMEMBER_SYSCALLS_WATCHER(Watcher):
+        def __init__(self, max_syscalls=None):
+            Watcher.__init__(self)
+            self._max_syscalls = max_syscalls
+            self._list_syscalls = []
+            self._syscallPattern = re.compile(r'(?P<syscall>\w+)\(.*')
+
+        @Watcher.watcher_call()
+        def __call__(self, line):
+            matcher = self._syscallPattern.match(line)
+            if matcher is None:
+                return True
+            syscall = matcher.group("syscall")
+            self._list_syscalls.append(syscall)
+            if self._max_syscalls is not None and len(self._list_syscalls) == self._max_syscalls:
+                return True
+            return False
+
+        @property
+        def list_syscalls(self):
+            return self._list_syscalls
+
+        @property
+        def max_syscalls(self):
+            return self._max_syscalls
+
     def __init__(self, tracer):
         self._tracer = tracer
         self._lines = []
