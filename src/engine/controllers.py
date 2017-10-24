@@ -51,7 +51,7 @@ class ExecutionController:
         self._reporter.handle_event(self._reporter.TRACER_STARTED_EVENT,
                                     first_line=self._parser.pop_line())
 
-        self._parser.add_watcher(name="drop", watcher=StraceOutputParser.REMEMBER_SYSCALLS_WATCHER())
+        self._parser.add_watcher(name="drop", watcher=StraceOutputParser.REMEMBER_SYSCALLS_WATCHER(skip_signals=False))
         self._parser.add_watcher(name="start", watcher=StraceOutputParser.REGEX_WATCHER(
             r'^execve\(\"' + re.escape(self._tracee.target) +
             r'", .*\) \= (?P<code>[-]?\d+)(?:$| (?P<errno>\w+) \((?P<strerror>(?:\w|\s)+)\)$)'))
@@ -103,9 +103,12 @@ class InjectionExecutionController(ExecutionController):
         self._succ_injections = tolist
 
     def execute(self):
-        self.start_processes()
+        # TODO temporary fix, it should be changed after changing way of injections
         self._parser.add_watcher(name="inject",
                                  watcher=StraceOutputParser.ERROR_INJECT_WATCHER(self.fault.syscall, self.fault.when))
+        self.start_processes()
+        #self._parser.add_watcher(name="inject",
+        #                         watcher=StraceOutputParser.ERROR_INJECT_WATCHER(self.fault.syscall, self.fault.when))
 
         previous_were = self._parser.watchers["inject"].were
         while True:
@@ -113,11 +116,12 @@ class InjectionExecutionController(ExecutionController):
             if len(watchers) != 0:
                 syscall = watchers["inject"].occasion
                 self._parser.remove_watcher(name="inject")
-                self._parser.add_watcher(name="sigsegv", watcher=StraceOutputParser.REGEX_WATCHER(
-                    r'^\+{3} killed by SIGSEGV \(core dumped\) \+{3}$'))
+                self._parser.add_watcher(name="terminate", watcher=StraceOutputParser.TERMINATION_WATCHER())
 
                 watchers = self._parser.continue_until_watchers()
-                if len(watchers) != 0:
+                if "terminate" in watchers and watchers["terminate"].type is \
+                        StraceOutputParser.TERMINATION_WATCHER.OCCASION_TYPE.KILLED and \
+                        watchers["terminate"].matcher.group("signal") == "SIGSEGV":
                     assert self._tracee.exitcode(blocking=True) == - signal.SIGSEGV
                     self._succ_injections.append(fault=self.fault, context=syscall)
 
@@ -139,11 +143,15 @@ class GeneratorExecutionController(ExecutionController):
 
     def execute(self):
         self.start_processes()
-        self._parser.add_watcher(name="counter", watcher=StraceOutputParser.REMEMBER_SYSCALLS_WATCHER())
+        self._parser.add_watcher(name="counter",
+                                 watcher=StraceOutputParser.REMEMBER_SYSCALLS_WATCHER(skip_signals=True))
 
         watchers = self._parser.continue_until_watchers()
         self._reporter.handle_event(self._reporter.STRACE_OUTPUT_NOT_SYSCALL_EVENT,
-                                    line=watchers["counter"].occasion if "counter" in watchers else None)
+                                    line=watchers["counter"].occasion
+                                    if "counter" in watchers and watchers["counter"].type is
+                                        StraceOutputParser.TERMINATION_WATCHER.OCCASION_TYPE.UNEXPECTED
+                                    else None)
 
         self._list_syscalls = self._parser.watchers["counter"].list_syscalls
         self._parser.remove_watcher("counter")

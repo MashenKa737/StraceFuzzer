@@ -1,5 +1,6 @@
 import re
 import time
+import enum
 
 
 class Watcher:
@@ -69,23 +70,67 @@ class StraceOutputParser:
         def matcher(self):
             return self._matcher
 
-    class REMEMBER_SYSCALLS_WATCHER(Watcher):
-        def __init__(self, max_syscalls=None):
+    class TERMINATION_WATCHER(Watcher):
+        class OCCASION_TYPE(enum.Enum):
+            SYSCALL = (r'^(?P<syscall>\w+)\(.*', False)
+            SYSCALL_RESUMED = (r'^\<\.{3} (?P<syscall>\w+) resumed\>.*', False)
+            SIGNAL = (r'^\-{3} (?P<signal>SIG\w+) \{.*\} \-{3}$', False)
+            EXITED = (r'^\+{3} exited with (?P<exitcode>\d+) \+{3}$', True)
+            KILLED = (r'^\+{3} killed by (?P<signal>SIG\w+) .*\+{3}$', True)
+            UNEXPECTED = (r'^(?P<line>.+)$', True)
+
+            def __init__(self, pattern, termination):
+                self._regex = re.compile(pattern)
+                self._termination = termination
+
+            def match_line(self, line: str):
+                return self._regex.match(line)
+
+            @property
+            def termination(self):
+                return self._termination
+
+        def __init__(self):
             Watcher.__init__(self)
-            self._max_syscalls = max_syscalls
-            self._list_syscalls = []
-            self._syscallPattern = re.compile(r'(?P<syscall>\w+)\(.*')
+            self._type = None
+            self._matcher = None
 
         @Watcher.watcher_call()
         def __call__(self, line):
-            matcher = self._syscallPattern.match(line)
-            if matcher is None:
+            for member in list(self.OCCASION_TYPE):
+                self._matcher = member.match_line(line)
+                if self._matcher is not None:
+                    self._type = member
+                    return member.termination
+
+            raise NotImplementedError
+
+        @property
+        def type(self):
+            return self._type
+
+        @property
+        def matcher(self):
+            return self._matcher
+
+    class REMEMBER_SYSCALLS_WATCHER(TERMINATION_WATCHER):
+        def __init__(self, max_syscalls=None, skip_signals=True):
+            super().__init__()
+            self._max_syscalls = max_syscalls
+            self._list_syscalls = []
+            self._skip_signals = skip_signals
+
+        @Watcher.watcher_call()
+        def __call__(self, line):
+            terminated = super().__call__(line)
+            if self.type == self.OCCASION_TYPE.SYSCALL:
+                self._list_syscalls.append(self.matcher.group("syscall"))
+                if self._max_syscalls is not None and len(self._list_syscalls) == self._max_syscalls:
+                    return True
+
+            if not self._skip_signals and self.type is self.OCCASION_TYPE.SIGNAL:
                 return True
-            syscall = matcher.group("syscall")
-            self._list_syscalls.append(syscall)
-            if self._max_syscalls is not None and len(self._list_syscalls) == self._max_syscalls:
-                return True
-            return False
+            return terminated
 
         @property
         def list_syscalls(self):

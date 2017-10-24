@@ -72,11 +72,8 @@ class ErrorReporter:
 
         return self._handle_error()
 
-    # TODO and checking for signals and syscall resuming
     def _strace_output_not_syscall_event(self, line=None):
         if line is None:
-            return True
-        if re.match(r'^\+{3} (killed by .+|exited with \d+) \+{3}$', line):
             return True
 
         print(self.prog + ': Unexpected strace output line: ' + line, file=self.tofile)
